@@ -43,7 +43,13 @@ Sample_Data: Bandai_Dataset_csv_modi_tot 사용
 - .csv 추출 과정: .bvh -> Blender (->.fbx) -> Unity(.csv)
 
 ## Done
-- 원본 데이터를 .csv로 가공 (Unity 좌표계에 맞는 왼손, Y up, Quarternion)
-- .csv -> .pt (for Machine Learning)
-- PVTVAE 구조 설계
-- 100 Epochs 학습 (처음 20 Epochs는 KL만, 이후 PL(0~0.1 for 20 epochs))
++ 원본 데이터를 .csv로 가공 (Unity 좌표계에 맞는 왼손, Y up, Quarternion)
++ .csv -> .pt (for Machine Learning)
++ PVTVAE 구조 설계
++ 100 Epochs 학습 (처음 20 Epochs는 KL만, 이후 PL(0~0.1 for 20 epochs))  
+  
+- 2026.07.06
+    + 원본 데이터 정규화 (preprocess_motion.py / processed_motions_VMC)
+    + AI_model/* 수정
+    + jitter_loss 삭제 ()
+    + epoch 100 / 200으로 lambda_phys 값 수정하여 결과 확인
