@@ -3,8 +3,11 @@ import glob
 import torch
 import numpy as np
 from models import PVTVAE
-from dataset_pipeline import PARENTS, BONE_NAMES
+from dataset_pipeline import (PARENTS, BONE_NAMES, BONE_RADII, get_split_files,
+                              find_run_dir_by_config, find_latest_checkpoint_in, list_available_runs)
 from physics_module import DifferentiablePhysics
+# 추론 대상 실험도 train.py의 손실 가중치로 선택한다 (과거 실험 재현 가능).
+from train import LAMBDA_RECON, LAMBDA_PHYS, BETA_KL
 
 # 1. 환경 설정 및 디바이스 정의
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -20,59 +23,60 @@ COLLIDING_PAIRS = [
 
 def inference():
     # 2. 폴더 경로 탐색 (자동 감지)
-    # 현재 실행 위치가 Transformer_Temp 내부인지, 아니면 Warudo_Send_Temp인지 파악합니다.
-    checkpoint_dir = "../checkpoints" if os.path.exists("../checkpoints") else "checkpoints"
-    motions_dir = "../processed_motions" if os.path.exists("../processed_motions") else "processed_motions"
-    
-    CHECKPOINT_PATH = os.path.join(checkpoint_dir, "pvtvae_epoch_100.pth")
-    
-    if not os.path.exists(CHECKPOINT_PATH):
-        raise FileNotFoundError(f"가중치 파일을 찾을 수 없습니다: {CHECKPOINT_PATH}\n(폴더 위치를 확인해주세요!)")
+    motions_dir = "../processed_motions_VMC" if os.path.exists("../processed_motions_VMC") else "processed_motions_VMC"
 
-    # 3. 학습한 Model
-    model = PVTVAE(input_dim=147, latent_dim=64).to(DEVICE)
+    # train.py에 설정된 손실 가중치와 일치하는 run 폴더에서 마지막 epoch 가중치를 선택한다.
+    run_dir = find_run_dir_by_config(LAMBDA_RECON, LAMBDA_PHYS, BETA_KL)
+    CHECKPOINT_PATH = find_latest_checkpoint_in(run_dir) if run_dir else None
+    if not CHECKPOINT_PATH:
+        target = f"recon{LAMBDA_RECON:g}_phys{LAMBDA_PHYS:g}_kl{BETA_KL:g}"
+        raise FileNotFoundError(
+            f"설정과 일치하는 가중치 폴더(checkpoints/{target}/)를 찾을 수 없습니다.\n"
+            f"사용 가능한 실험 폴더: {list_available_runs()}\n"
+            f"(train.py의 LAMBDA_* 값을 위 이름 중 하나에 맞추거나 먼저 학습하세요.)")
+    print(f"📦 가중치 로드: {os.path.relpath(CHECKPOINT_PATH)}")
+
+    # 3. 학습한 Model (새 양식: 입력 87, 출력 84 쿼터니언)
+    model = PVTVAE(input_dim=87, output_dim=84, latent_dim=64).to(DEVICE)
     model.load_state_dict(torch.load(CHECKPOINT_PATH, map_location=DEVICE))
     model.eval() # 평가(Inference) 모드로 전환
     print("성공: Trained model loaded.")
 
-    physics_engine = DifferentiablePhysics(PARENTS, {b: 0.05 for b in BONE_NAMES}).to(DEVICE)
+    physics_engine = DifferentiablePhysics(PARENTS, BONE_RADII).to(DEVICE)
 
     # ==========================================
     # 4. 테스트 데이터 로드 및 전처리
     # ==========================================
-    pt_files = glob.glob(os.path.join(motions_dir, "*.pt"))
+    # 🚨 과적합 방지: 학습에 쓰지 않은 held-out(test) 파일에서만 샘플을 고른다.
+    pt_files = get_split_files(motions_dir, split='test')
     if not pt_files:
-        raise FileNotFoundError(f" '{motions_dir}' 폴더에 .pt 파일이 없습니다.")
-        
-    # 랜덤으로 아무 파일이나 하나 골라서 테스트합니다 (원하시면 pt_files[0]으로 고정해도 됩니다)
-    TEST_FILE_PATH = np.random.choice(pt_files) 
-    print(f"🎬 테스트 대상 모션 파일: {os.path.basename(TEST_FILE_PATH)}")
+        raise FileNotFoundError(f" '{motions_dir}' 폴더에 held-out(test) .pt 파일이 없습니다.")
+
+    # held-out 파일 중 무작위 1개로 단일 결과를 시각화한다.
+    TEST_FILE_PATH = np.random.choice(pt_files)
+    print(f"🎬 테스트 대상 모션 파일(held-out): {os.path.basename(TEST_FILE_PATH)}")
     
-    original_motion = torch.load(TEST_FILE_PATH)
-    
-    # 모델 입력 스펙([Batch=1, Seq=30, 147])에 맞추기 위해 첫 30프레임 추출 및 Flatten
+    original_motion = torch.load(TEST_FILE_PATH)  # [Frames, 87]
+
+    # 모델 입력 스펙([Batch=1, Seq=30, 87])에 맞추기 위해 첫 30프레임 추출
     if original_motion.shape[0] < 30:
         raise ValueError(" 테스트 파일의 프레임 길이가 30보다 짧습니다.")
-        
-    input_sequence = original_motion[:30].unsqueeze(0) # [1, 30, 21, 7]
-    input_flattened = input_sequence.view(1, 30, -1).to(DEVICE) # [1, 30, 147]
+
+    input_sequence = original_motion[:30].unsqueeze(0).to(DEVICE)  # [1, 30, 87]
 
     # ==========================================
     # 5. AI 모델을 통한 모션 교정 (Inference)
     # ==========================================
     with torch.no_grad(): # 미분 계산을 꺼서 메모리를 절약하고 속도를 높입니다.
-        recon_motion, _, _ = model(input_flattened)
-        
-    # 물리 연산 및 저장을 위해 다시 [1, 30, 21, 7] 형태로 복원
-    recon_reshaped = recon_motion.view(1, 30, 21, 7)
+        recon_motion, _, _ = model(input_sequence)  # [1, 30, 87]
 
     # ==========================================
-    # 6. 물리 엔진 검증 (Before & After 충돌 오차 비교)
+    # 6. 물리 엔진 검증 (Before & After 충돌 오차 비교) — FK 기반
     # ==========================================
-    input_sequence_cuda = input_sequence.to(DEVICE)
-    
-    loss_phys_before = physics_engine.get_collision_loss_from_tensor(input_sequence_cuda, COLLIDING_PAIRS)
-    loss_phys_after = physics_engine.get_collision_loss_from_tensor(recon_reshaped, COLLIDING_PAIRS)
+    loss_phys_before = physics_engine.get_collision_loss_from_quats(
+        input_sequence[..., :3], input_sequence[..., 3:], COLLIDING_PAIRS)
+    loss_phys_after = physics_engine.get_collision_loss_from_quats(
+        recon_motion[..., :3], recon_motion[..., 3:], COLLIDING_PAIRS)
 
     print("\n==============================================")
     print("물리 기반 모션 교정 평가 (Physics Evaluation)")
@@ -87,10 +91,10 @@ def inference():
     
     save_path_orig = os.path.join(output_dir, "sample_original.pt")
     save_path_corr = os.path.join(output_dir, "sample_corrected.pt")
-    
-    # 배치를 떼어내고 원래 차원인 [30, 21, 7]로 CPU에 저장
+
+    # 배치를 떼어내고 [30, 87] (Hips Pos 3 + Quats 84)로 CPU에 저장
     torch.save(input_sequence.squeeze(0).cpu(), save_path_orig)
-    torch.save(recon_reshaped.squeeze(0).cpu(), save_path_corr)
+    torch.save(recon_motion.squeeze(0).cpu(), save_path_corr)
     print(f" 결과 데이터가 '{output_dir}' 폴더에 저장되었습니다.")
 
 if __name__ == "__main__":

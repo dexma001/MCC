@@ -1,19 +1,14 @@
+import sys
 import os
 import glob
+import random
 import torch
 import numpy as np
 import pandas as pd
+from torch.utils.data import Dataset
 from scipy.spatial.transform import Rotation as R
 import matplotlib.pyplot as plt
-import matplotlib.animation as animation
-from torch.utils.data import Dataset, DataLoader
-import itertools
-
-# 0. 설정 및 상수
-MODE = "VISUALIZE"  # "PREPROCESS" 또는 "VISUALIZE"
-SEQ_LEN = 30
-CSV_DIR = r"Sample_Data/Bandai_Dataset_csv_modi_tot"
-PT_DIR = "processed_motions"
+from matplotlib.animation import FuncAnimation
 
 PARENTS = {
     'Hips': None, 'Spine': 'Hips', 'Chest': 'Spine', 'Neck': 'Chest', 'Head': 'Neck',
@@ -22,230 +17,370 @@ PARENTS = {
     'LeftUpperLeg': 'Hips', 'LeftLowerLeg': 'LeftUpperLeg', 'LeftFoot': 'LeftLowerLeg', 'LeftToes': 'LeftFoot',
     'RightUpperLeg': 'Hips', 'RightLowerLeg': 'RightUpperLeg', 'RightFoot': 'RightLowerLeg', 'RightToes': 'RightFoot'
 }
+
 BONE_NAMES = sorted(list(PARENTS.keys()))
 BONE_MAP = {name: i for i, name in enumerate(BONE_NAMES)}
-BONE_RADII = {b: 0.05 for b in BONE_NAMES} # 뼈대 Capsulize
+BONE_RADII = {
+    'Hips': 0.06, 'Spine': 0.04, 'Chest': 0.08, 'Neck': 0.03, 'Head': 0.05,
+    'LeftShoulder': 0.03, 'LeftUpperArm': 0.03, 'LeftLowerArm': 0.02, 'LeftHand': 0.02,
+    'RightShoulder': 0.03, 'RightUpperArm': 0.03, 'RightLowerArm': 0.02, 'RightHand': 0.02,
+    'LeftUpperLeg': 0.05, 'LeftLowerLeg': 0.04, 'LeftFoot': 0.03, 'LeftToes': 0.02,
+    'RightUpperLeg': 0.05, 'RightLowerLeg': 0.04, 'RightFoot': 0.03, 'RightToes': 0.02
+} # 뼈대 Capsulize
 
-# 1. 물리 엔진 핵심 모듈
-def apply_auto_calibration(tensor_data):
-    frame0 = tensor_data[0].numpy()
-    idx_hips, idx_neck = BONE_MAP['Hips'], BONE_MAP['Neck']
-    idx_rupper, idx_lupper = BONE_MAP['RightUpperLeg'], BONE_MAP['LeftUpperLeg']
-    
-    up = frame0[idx_neck, :3] - frame0[idx_hips, :3]
-    up /= np.linalg.norm(up) #Up 정의
-    right = frame0[idx_rupper, :3] - frame0[idx_lupper, :3]
-    right /= np.linalg.norm(right) #Right 정의
-    forward = np.cross(up, right) 
-    
-    rot_matrix = R.from_matrix(np.column_stack((right, forward, up)).T) 
-    
-    for f in range(tensor_data.shape[0]):
-        pos = tensor_data[f, :, :3].numpy()
-        tensor_data[f, :, :3] = torch.tensor(rot_matrix.apply(pos), dtype=torch.float32)
-        quat = tensor_data[f, :, 3:].numpy()
-        new_rot = rot_matrix * R.from_quat(quat[:, [0,1,2,3]])
-        tensor_data[f, :, 3:] = torch.tensor(new_rot.as_quat(), dtype=torch.float32)
-    return tensor_data
+# [추가] 뼈대 고정 오프셋 데이터 로드 함수
+def load_standard_offsets(offset_csv_path):
+    """Standard_BoneOffsets.csv 파일을 읽어 관절별 고정 3D 오프셋 딕셔너리를 반환합니다."""
+    df = pd.read_csv(offset_csv_path).set_index('BoneName')
+    offsets = {}
+    for bone in BONE_NAMES:
+        if bone in df.index:
+            row = df.loc[bone]
+            # 오프셋 컬럼명(px, py, pz 또는 offset_x 등)에 맞춰 안전하게 파싱
+            x = row.get('px', row.get('OffsetX', 0.0))
+            y = row.get('py', row.get('OffsetY', 0.0))
+            z = row.get('pz', row.get('OffsetZ', 0.0))
+            offsets[bone] = torch.tensor([x, y, z], dtype=torch.float32)
+        else:
+            offsets[bone] = torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32)
+    return offsets
 
-def apply_hips_centering(tensor_data):
-    """
-    tensor_data: [Frames, Joints, 7] (Pos 3, Quat 4)
-    모든 프레임의 모든 관절 위치(Pos)에서 Hips의 위치를 뺌
-    """
-    # Hips index
-    idx_hips = BONE_MAP['Hips']
-    
-    # 1. Hips의 위치 데이터만 추출 [Frames, 3]
-    hips_pos = tensor_data[:, idx_hips, :3].clone()
-    
-    # 2. 모든 프레임의 모든 관절 위치에서 Hips 위치를 뺍니다.
-    # tensor_data[:, :, :3] = [Frames, Joints, 3] 
-    # hips_pos.unsqueeze(1) = [Frames, 1, 3]
-    tensor_data[:, :, :3] = tensor_data[:, :, :3] - hips_pos.unsqueeze(1)
-    
-    return tensor_data
-
-def parse_csv_to_tensor(file_path):
-    df = pd.read_csv(file_path)
+# PREPROCESS: CSV 데이터를 [Hips_Pos(3) + Quats(84) = 87] 텐서로 변환
+def parse_csv_to_quaternion_tensor(motion_csv_path):
+    """입력받은 모션 CSV 파일에서 Hips 위치와 전 관절 쿼터니언을 추출합니다."""
+    df = pd.read_csv(motion_csv_path)
     frames = sorted(df['Frame'].unique())
     motion_list = []
     
     for f in frames:
         frame_data = df[df['Frame'] == f].set_index('BoneName')
-        global_pos, global_rot = {b: np.zeros(3) for b in BONE_NAMES}, {b: R.identity() for b in BONE_NAMES}
         
-        for bone in PARENTS.keys():
-            if bone not in frame_data.index: continue
+        # 1. Hips의 동적 Position 추출 [3차원]
+        hips_row = frame_data.loc['Hips']
+        hips_pos = torch.tensor([hips_row['px'], hips_row['py'], hips_row['pz']], dtype=torch.float32) / 100.0
+        
+        # 2. 21개 전 관절의 Quaternion 추출 [21 * 4 = 84차원]
+        quats_list = []
+        for bone in BONE_NAMES:
             row = frame_data.loc[bone]
-            local_p = np.array([row['px'], row['pz'], row['py']])
-            lr = R.from_quat([-row['qx'], -row['qz'], -row['qy'], row['qw']])
-            if bone != 'Hips': local_p *= 100.0
-            p_bone = PARENTS[bone]
-            if p_bone is None or p_bone not in global_pos:
-                global_pos[bone], global_rot[bone] = local_p, lr
-            else:
-                global_pos[bone] = global_pos[p_bone] + global_rot[p_bone].apply(local_p)
-                global_rot[bone] = global_rot[p_bone] * lr
+            q = torch.tensor([row['qx'], row['qy'], row['qz'], row['qw']], dtype=torch.float32)
+            # 안전을 위한 쿼터니언 정규화
+            q = q / (torch.norm(q) + 1e-8)
+            quats_list.append(q)
+            
+        quats_tensor = torch.cat(quats_list) # [84]
         
-        frame_tensor = torch.zeros((len(BONE_NAMES), 7))
-        for b, idx in BONE_MAP.items():
-            frame_tensor[idx] = torch.cat([torch.tensor(global_pos[b]), torch.tensor(global_rot[b].as_quat())])
+        # 3. [3 + 84 = 87] 차원으로 결합
+        frame_tensor = torch.cat([hips_pos, quats_tensor])
         motion_list.append(frame_tensor)
+        
     return torch.stack(motion_list)
 
-# 2. 데이터셋 및 파이프라인
-# 30 Frame 미만인 파일은 사용 X
+def convert_unity_to_python_tensor(motion_tensor):
+    """
+    VISUALIZE 모드에서만 사용됩니다.
+    [Frames, 87] Unity(Y-Up) 텐서를 FK 연산이 가능한 Python(Z-Up) 텐서로 완벽히 변환합니다.
+    """
+    converted = torch.zeros_like(motion_tensor)
+    
+    # 1. Hips Position: [x, y, z] -> [x, z, y]
+    converted[:, 0] = motion_tensor[:, 0] # px
+    converted[:, 1] = motion_tensor[:, 2] # pz (Unity z -> Python y)
+    converted[:, 2] = motion_tensor[:, 1] # py (Unity y -> Python z)
+    
+    # 2. Quaternions: [qx, qy, qz, qw] -> [-qx, -qz, -qy, qw]
+    # 회전 방향(Handedness)과 축 매핑을 동시에 파이썬 기준으로 보정합니다.
+    for i in range(21):
+        s = 3 + i * 4
+        converted[:, s+0]= -motion_tensor[:, s+0] # -qx
+        converted[:, s+1] = -motion_tensor[:, s+2] # -qz
+        converted[:, s+2] = -motion_tensor[:, s+1] # -qy
+        converted[:, s+3] =  motion_tensor[:, s+3] # qw
+
+    return converted
+
+def convert_offsets_to_python(offsets):
+    """FK 연산을 위해 오프셋 [x, y, z]를 파이썬 기준 [x, z, y]로 변환합니다."""
+    converted = {}
+    for bone, vec in offsets.items():
+        converted[bone] = torch.tensor([vec[0], vec[2], vec[1]], dtype=torch.float32)
+    return converted
+
+# PYTHON 3D 시각화용: 오프셋 + 쿼터니언 순방향 운동학(FK) 뼈대 복원 함수
+def compute_skeleton_positions(hips_pos, quats_84, offsets):
+    quats = quats_84.view(len(BONE_NAMES), 4).numpy()
+    global_pos = {}
+    global_rot = {}
+    
+    global_pos['Hips'] = hips_pos.numpy()
+    global_rot['Hips'] = R.from_quat(quats[BONE_MAP['Hips']])
+    
+    for child, parent in PARENTS.items():
+        if parent is None: continue
+        c_idx = BONE_MAP[child]
+        local_rot = R.from_quat(quats[c_idx])
+        child_offset = offsets[child].numpy()
+        
+        global_pos[child] = global_pos[parent] + global_rot[parent].apply(child_offset)
+        global_rot[child] = global_rot[parent] * local_rot
+        
+    return global_pos
+
+def get_pos_tensor(frame_tensor_87, offsets):
+    hips_pos = frame_tensor_87[:3]
+    quats_84 = frame_tensor_87[3:]
+    pos_dict = compute_skeleton_positions(hips_pos, quats_84, offsets)
+    
+    pos_tensor = torch.zeros((len(BONE_NAMES), 3))
+    for b, idx in BONE_MAP.items():
+        pos_tensor[idx] = torch.tensor(pos_dict[b], dtype=torch.float32)
+    return pos_tensor
+
+# ============================================================
+# Train / Test 분할 (과적합 검증용 held-out set)
+# ============================================================
+# 모든 스크립트(train / evaluate / inference)가 동일한 결정론적 분할을 공유하도록
+# 고정 seed로 셔플한 뒤 앞쪽 VAL_RATIO 비율을 held-out(test)으로, 나머지를 train으로 사용.
+VAL_RATIO = 0.1     # 전체의 10%를 학습에 쓰지 않고 평가 전용으로 격리
+SPLIT_SEED = 42     # 분할 재현성을 위한 고정 시드
+
+def get_split_files(pt_dir, split='train', val_ratio=VAL_RATIO, seed=SPLIT_SEED):
+    """
+    pt_dir 내 .pt 파일을 결정론적으로 train / test 로 나눈다.
+      split='train' -> 학습용, 'test'(='val') -> 평가/추론용 held-out, 'all' -> 전체
+    """
+    files = sorted(glob.glob(os.path.join(pt_dir, "*.pt")))   # sorted로 순서 고정
+    rng = random.Random(seed)
+    rng.shuffle(files)
+    n_val = int(len(files) * val_ratio)
+    test_files = files[:n_val]
+    train_files = files[n_val:]
+
+    if split == 'train':
+        return train_files
+    if split in ('test', 'val'):
+        return test_files
+    return files
+
+
+# ============================================================
+# 체크포인트 폴더 관리 (실험용 가중치별로 폴더 분리)
+# ============================================================
+# 실험마다 checkpoints/ 아래에 사용된 손실 가중치를 이름으로 하는 하위 폴더를 만들어
+# 가중치 파일 / run_config.json / log.txt 를 격리한다. 이렇게 하면 lambda 스윕 시
+# 이전 실험 결과가 덮어써지지 않고, 폴더 이름만 봐도 어떤 설정인지 알 수 있다.
+
+def make_run_name(lambda_recon, lambda_phys, beta_kl):
+    """실험 손실 가중치를 사람이 읽기 쉬운 폴더명으로 변환. 예: recon1_phys0.5_kl0.01"""
+    def fmt(v):
+        return f"{float(v):g}"   # 1.0 -> '1', 0.5 -> '0.5', 0.01 -> '0.01'
+    return f"recon{fmt(lambda_recon)}_phys{fmt(lambda_phys)}_kl{fmt(beta_kl)}"
+
+
+def resolve_ckpt_root():
+    """실행 위치(project root / AI_model)에 무관하게 checkpoints 루트 경로를 반환."""
+    return "checkpoints" if os.path.exists("checkpoints") else "../checkpoints"
+
+
+def find_latest_run_dir(ckpt_root=None):
+    """
+    가중치가 들어있는 run 하위 폴더 중 가장 최근에 학습된 폴더 경로를 반환한다.
+    하위 폴더 구조가 없으면 구(舊) 평면 구조(ckpt_root 직속에 .pth) 호환으로 ckpt_root를 반환.
+    아무 가중치도 없으면 None.
+    """
+    ckpt_root = ckpt_root or resolve_ckpt_root()
+    run_dirs = [d for d in glob.glob(os.path.join(ckpt_root, "*"))
+                if os.path.isdir(d) and glob.glob(os.path.join(d, "pvtvae_epoch_*.pth"))]
+    if run_dirs:
+        return max(run_dirs, key=os.path.getmtime)
+    if glob.glob(os.path.join(ckpt_root, "pvtvae_epoch_*.pth")):
+        return ckpt_root   # 구 평면 구조 호환
+    return None
+
+
+def find_latest_checkpoint_in(run_dir):
+    """주어진 run 폴더에서 가장 마지막 epoch 가중치 경로를 반환 (없으면 None)."""
+    ckpts = glob.glob(os.path.join(run_dir, "pvtvae_epoch_*.pth"))
+    if not ckpts:
+        return None
+    return max(ckpts, key=lambda x: int(os.path.basename(x).split('_')[2].split('.')[0]))
+
+
+def find_run_dir_by_config(lambda_recon, lambda_phys, beta_kl, ckpt_root=None):
+    """
+    손실 가중치 조합으로 특정 실험의 run 폴더를 직접 찾는다 (mtime이 아니라 설정으로 선택).
+    train.py에서 쓰던 값과 동일한 (recon, phys, kl)을 주면 그 실험의 폴더를 반환하므로,
+    가장 최근 실험이 아니라 '과거의 특정 실험'도 다시 평가할 수 있다.
+    가중치(.pth)가 들어있는 해당 폴더 경로를 반환하고, 없으면 None.
+    """
+    ckpt_root = ckpt_root or resolve_ckpt_root()
+    run_dir = os.path.join(ckpt_root, make_run_name(lambda_recon, lambda_phys, beta_kl))
+    if os.path.isdir(run_dir) and glob.glob(os.path.join(run_dir, "pvtvae_epoch_*.pth")):
+        return run_dir
+    return None
+
+
+def list_available_runs(ckpt_root=None):
+    """가중치가 들어있는 모든 run 폴더 이름 목록 (에러 메시지에서 사용자 안내용)."""
+    ckpt_root = ckpt_root or resolve_ckpt_root()
+    return sorted(os.path.basename(d) for d in glob.glob(os.path.join(ckpt_root, "*"))
+                  if os.path.isdir(d) and glob.glob(os.path.join(d, "pvtvae_epoch_*.pth")))
+
+
+# [수정] 머신러닝 데이터셋 클래스 (훈련 시에는 84차원 쿼터니언만 분리 제공)
 class BandaiMotionDataset(Dataset):
-    def __init__(self, processed_dir, seq_len=30):
+    def __init__(self, pt_dir, seq_len=30, split='train'):
+        # split='train'은 held-out test 파일을 제외한 학습용 파일만 로드
+        self.pt_files = get_split_files(pt_dir, split=split)
         self.seq_len = seq_len
-        raw_file_list = glob.glob(os.path.join(processed_dir, "*.pt"))
-        if not raw_file_list: 
-            raise ValueError("데이터셋이 비어있습니다. PREPROCESS 모드를 먼저 실행하세요.")
-        
-        self.file_list = []
-        print("🔍 데이터셋 무결성 검사 중...")
-        
-        # 30프레임 이상인 데이터만 골라내어 학습 목록에 추가합니다.
-        for f in raw_file_list:
-            motion_shape = torch.load(f).shape[0]
-            if motion_shape >= self.seq_len:
-                self.file_list.append(f)
-                
-        if not self.file_list:
-            raise ValueError(f"모든 데이터가 {self.seq_len} 프레임보다 짧습니다.")
-            
-        print(f"✅ 총 {len(raw_file_list)}개 중 {len(self.file_list)}개의 유효한 데이터를 로드했습니다.")
-        
-    def __len__(self): 
-        return len(self.file_list)
+        self.data = []
+
+        for f in self.pt_files:
+            tensor = torch.load(f) # [Frames, 87]
+            if tensor.shape[0] >= seq_len:
+                self.data.append(tensor)
+
+    def __len__(self):
+        return len(self.data)
         
     def __getitem__(self, idx):
-        motion = torch.load(self.file_list[idx])
-        max_start = motion.shape[0] - self.seq_len
-        start = np.random.randint(0, max_start) if max_start > 0 else 0
-        return motion[start : start + self.seq_len]
+        tensor = self.data[idx]
+        start = np.random.randint(0, tensor.shape[0] - self.seq_len + 1)
+        window = tensor[start : start + self.seq_len] # [30, 87]
+
+        # 새 양식: Hips Position(3) + 21 Quaternion(84) = 87 전체를 모델 입력으로 반환
+        return window
 
 # 3. main
 if __name__ == "__main__":
-    # MODE: 전역 정의
+    MODE = "VISUALIZE"
+
+    # 경로 설정
+    RAW_CSV_DIR = r"Sample_Data/Bandai_Dataset_csv_VMC_Normalized"
+    PROCESSED_PT_DIR = "processed_motions_VMC"
+    OFFSET_CSV_PATH = r"Sample_Data/Standard_BoneOffsets.csv"
+    # COMPARE 모드가 읽을 결과 폴더 (demo_maker.py → "demo_results", inference.py → "inference_results")
+    RESULTS_DIR = "demo_results"
+    # 경로를 지정하면(예: "demo_results/compare.gif") COMPARE 애니메이션을 파일로도 저장 (발표 슬라이드용)
+    SAVE_ANIMATION_PATH = ""
+
+    # 고정 오프셋 뼈대 사전 로드
+    if os.path.exists(OFFSET_CSV_PATH):
+        STANDARD_OFFSETS = load_standard_offsets(OFFSET_CSV_PATH)
+    else:
+        print("Error / No_OFFSET")
+        sys.exit()
+        
     if MODE == "PREPROCESS":
-        os.makedirs(PT_DIR, exist_ok=True)
-        all_csv = glob.glob(os.path.join(CSV_DIR, "**", "*.csv"), recursive=True)
-        for f in all_csv:
-            save_path = os.path.join(PT_DIR, os.path.basename(f).replace('.csv', '.pt'))
-            if not os.path.exists(save_path):
-                print(f"Processing: {f}")
-                raw = parse_csv_to_tensor(f)
-                
-                # 순서: 1. 방향 정렬 -> 2. 위치 정규화
-                calibrated = apply_auto_calibration(raw)
-                final_data = apply_hips_centering(calibrated)
-                
-                torch.save(final_data, save_path)
-        print("✅ 전처리 완료.")
+        os.makedirs(PROCESSED_PT_DIR, exist_ok=True)
+        csv_files = glob.glob(os.path.join(RAW_CSV_DIR, "**", "*.csv"), recursive = True)
+        
+        print(f"🔄 전처리 시작: 총 {len(csv_files)}개의 파일을 변환합니다.")
+        for csv_path in csv_files:
+            file_name = os.path.basename(csv_path).replace(".csv", ".pt")
+            # 87차원 추출 함수 호출
+            motion_tensor = parse_csv_to_quaternion_tensor(csv_path)
+            torch.save(motion_tensor, os.path.join(PROCESSED_PT_DIR, file_name))
+        print("✅ 모든 파일이 [Frames, 87] 차원의 .pt 텐서로 변환 완료되었습니다.")
 
     elif MODE == "VISUALIZE":
         """
         출력 전체 확인
         pt_files = glob.glob(os.path.join(PT_DIR, "*.pt"))
-        motion = torch.load(pt_files[0]) # 전체 128프레임이 그대로 로드됨
-        print(f"🎬 전체 데이터 로드 완료: {motion.shape}")
+        motion = torch.load(pt_files[0]) # 전체 87프레임이 그대로 로드됨
+        print(f"전체 데이터 로드 완료: {motion.shape}")
         """
-        
-        VISUALIZE_TYPE = "COMPARE" #SINGLE: 변환한 단일 .pth 파일 / COMPARE: demo_maker / inference로 변환한 비교 파일
-        
+        VISUALIZE_TYPE = "COMPARE" #SINGLE 또는 COMPARE
+    
         if VISUALIZE_TYPE == "SINGLE":
-            TARGET_FILE = r"processed_motions/dataset-2_walk-turn-right_exhausted_027.pt" 
+            TARGET_FILE = '' #r"processed_motions_VMC/dataset-2_run_active_047.pt"
 
-            # 1. 데이터 로드 확인
             if TARGET_FILE and os.path.exists(TARGET_FILE):
                 print(f"지정된 특정 파일 로드 중: {TARGET_FILE}")
                 motion = torch.load(TARGET_FILE)
-                # GPU에 올라가 있는 텐서일 경우를 대비해 CPU로 내림
-                if motion.device.type != 'cpu':
-                    motion = motion.cpu()
             else:
-                print("지정된 파일이 없거나 경로가 잘못되어, 데이터셋에서 무작위로 로드합니다.")
-                dataset = BandaiMotionDataset(PT_DIR, seq_len=100)
-                if len(dataset) == 0:
-                    print("데이터가 없습니다. PREPROCESS 모드를 먼저 실행하세요.")
-                    import sys; sys.exit()
-                motion = dataset[0] # [Frames, Joints, 7]
+                print("지정된 파일이 없어 무작위로 하나의 파일을 로드합니다.")
+                #[수정된 부분] 전체 데이터셋을 로드하지 않고 파일 '경로'만 가져와서 무작위 선택
+                pt_files = glob.glob(os.path.join(PROCESSED_PT_DIR, "*.pt"))
+                
+                if not pt_files:
+                    print("에러: 처리된 .pt 파일이 없습니다.")
+                    sys.exit()
+                
+                random_file = random.choice(pt_files)
+                print(f"무작위 선택된 파일: {os.path.basename(random_file)}")
+                motion = torch.load(random_file) 
+            
+            if motion.device.type != 'cpu': motion = motion.cpu()
 
-            print(f"🎬 데이터 로드 완료: {motion.shape} (Frames, Joints, 7)")
+            print(f"데이터 로드 완료: {motion.shape}")
 
-            # 2. 렌더링 설정
+            motion_py = convert_unity_to_python_tensor(motion)
+            offsets_py = convert_offsets_to_python(STANDARD_OFFSETS)
+            
             fig = plt.figure(figsize=(10, 10))
             ax = fig.add_subplot(111, projection='3d')
-            ax.set_title("Single Motion Viewer", pad=10)
+            ax.set_title("Single Motion Viewer (Python Adapter Applied)", pad=10)
             
-            # 뼈대 연결 정보 생성
             bones_to_draw = [(PARENTS[b], b) for b in BONE_NAMES if PARENTS[b] in BONE_NAMES]
             lines = [ax.plot([], [], [], 'o-', lw=2, color='blue')[0] for _ in bones_to_draw]
 
-            ax.set_xlim(-0.8, 0.8); ax.set_ylim(-0.8, 0.8); ax.set_zlim(0, 1.8)
+            ax.set_xlim(-0.8, 0.8); ax.set_ylim(-0.8, 0.8); ax.set_zlim(0, 1.6)
             ax.view_init(elev=15, azim=45)
+            
+            ax.set_xlabel('X (Left / Right)', fontsize=10, labelpad=10)
+            ax.set_ylabel('Y (Depth / Unity Z)', fontsize=10, labelpad=10)
+            ax.set_zlabel('Z (Height / Unity Y)', fontsize=10, labelpad=10)
 
             def update(frame_idx):
-                # motion[frame_idx]는 [Joints, 7] 형태
-                frame_pos = motion[frame_idx, :, :3] # [Joints, 3]
+                # 어댑터를 거친 파이썬 전용 텐서를 사용하여 FK(순방향 운동학) 연산을 안전하게 수행합니다.
+                frame_pos = get_pos_tensor(motion_py[frame_idx], offsets_py) 
+                frame_pos_np = frame_pos.numpy()
                 
                 for i, (parent_name, child_name) in enumerate(bones_to_draw):
-                    # BONE_MAP을 사용하여 해당 뼈대의 인덱스 추출
-                    p_idx = BONE_MAP[parent_name]
-                    c_idx = BONE_MAP[child_name]
-                    
-                    p_pos = frame_pos[p_idx]
-                    c_pos = frame_pos[c_idx]
+                    p_idx, c_idx = BONE_MAP[parent_name], BONE_MAP[child_name]
+                    p_pos, c_pos = frame_pos_np[p_idx], frame_pos_np[c_idx]
                     
                     lines[i].set_data([p_pos[0], c_pos[0]], [p_pos[1], c_pos[1]])
                     lines[i].set_3d_properties([p_pos[2], c_pos[2]])
-                
-                # 3D 축 범위 설정 (데이터가 보일 수 있도록)
-                ax.set_xlim(-1, 1); ax.set_ylim(-1, 1); ax.set_zlim(0, 2)
                 return lines
 
-            ani = animation.FuncAnimation(fig, update, frames=motion.shape[0], interval=33, blit=False)
-            
-            def on_scroll(event):
-                scale_factor = 0.9 if event.button == 'up' else 1.1
-                ax.set_xlim([x * scale_factor for x in ax.get_xlim()])
-                ax.set_ylim([y * scale_factor for y in ax.get_ylim()])
-                ax.set_zlim([z * scale_factor for z in ax.get_zlim()])
-                fig.canvas.draw_idle()
-                fig.canvas.mpl_connect('scroll_event', on_scroll)
+            ani = FuncAnimation(fig, update, frames=motion_py.shape[0], interval=33, blit=False)
             plt.show()
-                  
+                
         elif VISUALIZE_TYPE == "COMPARE":
             print("Before & After 비교 시각화 모드입니다.")
-            # demo_maker -> demo_results
-            # inference -> inference_results
             
             from physics_module import DifferentiablePhysics
             DEVICE = 'cpu'
-            physics_engine = DifferentiablePhysics(PARENTS, {b: 0.05 for b in BONE_NAMES}).to(DEVICE)
+            physics_engine = DifferentiablePhysics(PARENTS, BONE_RADII).to(DEVICE)
 
-            orig_path = "demo_results/sample_original.pt"
-            corr_path = "demo_results/sample_corrected.pt"
+            orig_path = os.path.join(RESULTS_DIR, "sample_original.pt")
+            corr_path = os.path.join(RESULTS_DIR, "sample_corrected.pt")
 
             if not os.path.exists(orig_path) or not os.path.exists(corr_path):
-                print("결과를 찾을 수 없습니다. 먼저 python inference/demo_maker.py를 실행하세요.")
-                import sys; sys.exit()
+                print(f"'{RESULTS_DIR}'에서 결과를 찾을 수 없습니다. 먼저 demo_maker.py(또는 inference.py)를 실행하세요.")
+                sys.exit()
                 
             motion_orig = torch.load(orig_path).cpu()
             motion_corr = torch.load(corr_path).cpu()
             
-            # 시각화를 위해 캡슐 뼈대 그룹 재정의 (어깨 제외)
+            # 🚨 [핵심 수정] COMPARE 모드에서도 FK 연산 전 Python 좌표계 어댑터를 무조건 통과시킵니다.
+            motion_orig_py = convert_unity_to_python_tensor(motion_orig)
+            motion_corr_py = convert_unity_to_python_tensor(motion_corr)
+            offsets_py = convert_offsets_to_python(STANDARD_OFFSETS)
+            
+            # 각 캡슐이 실제로 차지하는 뼈 세그먼트만 하이라이트한다 (세그먼트는 자식 뼈 이름으로 식별).
+            # 예: Hips→Chest 캡슐 = Hips-Spine-Chest 구간 = 'Spine', 'Chest' 세그먼트.
+            # (기존에는 Neck/Head/Toes 등 캡슐 밖 세그먼트까지 빨갛게 표시되어 충돌 부위가 과장되었음)
             CAPSULE_BONES = {
-                'Hips_Chest': ['Spine', 'Chest', 'Neck', 'Head'],
-                'LeftArm': ['LeftLowerArm', 'LeftHand'],
-                'RightArm': ['RightLowerArm', 'RightHand'],
-                'LeftLeg': ['LeftLowerLeg', 'LeftFoot', 'LeftToes'],
-                'RightLeg': ['RightLowerLeg', 'RightFoot', 'RightToes']
+                'Hips_Chest': ['Spine', 'Chest'],
+                'LeftArm': ['LeftHand'],        # LeftLowerArm→LeftHand 캡슐 = 팔꿈치-손 세그먼트
+                'RightArm': ['RightHand'],
+                'LeftLeg': ['LeftFoot'],        # LeftLowerLeg→LeftFoot 캡슐 = 무릎-발 세그먼트
+                'RightLeg': ['RightFoot']
             }
             
-            # [핵심] 어깨(Shoulder)를 제외한 안전한 페어
             TEST_PAIRS = [
                 ('Hips_Chest', 'LeftArm', 'Hips', 'Chest', 'LeftLowerArm', 'LeftHand'),
                 ('Hips_Chest', 'RightArm', 'Hips', 'Chest', 'RightLowerArm', 'RightHand'),
@@ -253,115 +388,121 @@ if __name__ == "__main__":
                 ('LeftLeg', 'RightLeg', 'LeftLowerLeg', 'LeftFoot', 'RightLowerLeg', 'RightFoot')
             ]
 
+            # 침투 판정 기준을 물리 엔진(get_collision_loss)과 동일하게: 두 캡슐 끝점(자식 뼈) 반지름의 합.
+            # (기존의 고정 0.1m 기준은 팔↔팔(0.04) / 다리↔다리(0.06) 페어를 과잉 표시했음)
+            PAIR_THRESHOLDS = [BONE_RADII[c1] + BONE_RADII[c2] for (_, _, _, c1, _, c2) in TEST_PAIRS]
+            DEPTH_FULL_RED = 0.02   # 침투 깊이 2cm 이상이면 최대 강도 빨강 (색 그라데이션 상한)
+
             fig = plt.figure(figsize=(14, 7))
-            fig.suptitle("AI Motion Correction: Before & After (Physics Fixed)", fontsize=16, fontweight='bold')
+            fig.suptitle("AI Motion Correction (Python Adapter Applied)", fontsize=16, fontweight='bold')
 
             ax1 = fig.add_subplot(121, projection='3d')
-            ax1.set_title("Before (Original)", pad=10)
             ax2 = fig.add_subplot(122, projection='3d')
-            ax2.set_title("After (AI Corrected)", pad=10)
+            ax1.set_title("Before (Original / Injected)", fontsize=12)
+            ax2.set_title("After (AI Corrected)", fontsize=12)
+
+            # 프레임별 최대 침투 깊이(cm)를 패널 위에 수치로 표시 — 시각 결과와 수치가 항상 일치하도록
+            txt_orig = ax1.text2D(0.02, 0.98, "", transform=ax1.transAxes,
+                                  fontsize=11, va='top', fontweight='bold')
+            txt_corr = ax2.text2D(0.02, 0.98, "", transform=ax2.transAxes,
+                                  fontsize=11, va='top', fontweight='bold')
 
             bones_to_draw = [(PARENTS[b], b) for b in BONE_NAMES if PARENTS[b] in BONE_NAMES]
 
-            lines_orig_bone = [ax1.plot([], [], [], 'o-', lw=2.0, markersize=3, color='salmon')[0] for _ in bones_to_draw]
-            lines_orig_capsule = [ax1.plot([], [], [], '-', lw=18, color='salmon', alpha=0.15)[0] for _ in bones_to_draw]
-            lines_corr_bone = [ax2.plot([], [], [], 'o-', lw=2.0, markersize=3, color='dodgerblue')[0] for _ in bones_to_draw]
-            lines_corr_capsule = [ax2.plot([], [], [], '-', lw=18, color='dodgerblue', alpha=0.15)[0] for _ in bones_to_draw]
+            lines_orig_bone = [ax1.plot([], [], [], 'o-', lw=2.0, color='salmon')[0] for _ in bones_to_draw]
+            lines_corr_bone = [ax2.plot([], [], [], 'o-', lw=2.0, color='dodgerblue')[0] for _ in bones_to_draw]
+
+            lines_orig_capsule = []
+            lines_corr_capsule = []
+            LW_SCALE = 400.0 
+            
+            for parent_name, child_name in bones_to_draw:
+                actual_radius = BONE_RADII.get(child_name, 0.05) 
+                dynamic_lw = actual_radius * LW_SCALE
+                lines_orig_capsule.append(ax1.plot([], [], [], '-', lw=dynamic_lw, color='salmon', alpha=0.15)[0])
+                lines_corr_capsule.append(ax2.plot([], [], [], '-', lw=dynamic_lw, color='dodgerblue', alpha=0.15)[0])
 
             for ax in [ax1, ax2]:
                 ax.set_xlim(-0.8, 0.8); ax.set_ylim(-0.8, 0.8); ax.set_zlim(0, 1.8)
                 ax.view_init(elev=15, azim=45)
 
+            def pair_penetrations(pos_t):
+                """
+                현재 프레임의 관절 위치 텐서 [21, 3]에서 TEST_PAIRS별 침투 깊이(m)를 계산해
+                {뼈이름: 최대 침투 깊이} 딕셔너리로 반환. 판정 기준은 물리 엔진과 동일(반지름 합).
+                """
+                depths = {}
+                for (cap1, cap2, p1, c1, p2, c2), threshold in zip(TEST_PAIRS, PAIR_THRESHOLDS):
+                    dist = physics_engine.capsule_distance(
+                        pos_t[BONE_MAP[p1]], pos_t[BONE_MAP[c1]],
+                        pos_t[BONE_MAP[p2]], pos_t[BONE_MAP[c2]]
+                    ).item()
+                    pen = max(0.0, threshold - dist)
+                    if pen > 0:
+                        for b in CAPSULE_BONES[cap1] + CAPSULE_BONES[cap2]:
+                            depths[b] = max(depths.get(b, 0.0), pen)
+                return depths
+
+            def depth_style(depth, base_bone_color, base_cap_color):
+                """침투 깊이(m)에 비례한 (뼈 색, 캡슐 색, 캡슐 알파). 얕은 접촉=옅은 빨강, 깊은 침투=진한 빨강."""
+                if depth <= 0.0:
+                    return base_bone_color, base_cap_color, 0.15
+                t = min(depth / DEPTH_FULL_RED, 1.0)
+                col = plt.cm.Reds(0.45 + 0.55 * t)
+                return col, col, 0.25 + 0.45 * t
+
+            def set_panel_text(txt, depths):
+                max_pen = max(depths.values(), default=0.0)
+                if max_pen > 0:
+                    txt.set_text(f"max penetration: {max_pen * 100:.1f} cm")
+                    txt.set_color('red')
+                else:
+                    txt.set_text("no collision")
+                    txt.set_color('dimgray')
+
             def update_compare(frame_idx):
-                pos_orig_t = motion_orig[frame_idx, :, :3]
-                pos_corr_t = motion_corr[frame_idx, :, :3]
+                pos_orig_t = get_pos_tensor(motion_orig_py[frame_idx], offsets_py)
+                pos_corr_t = get_pos_tensor(motion_corr_py[frame_idx], offsets_py)
 
                 pos_orig_np = pos_orig_t.numpy()
                 pos_corr_np = pos_corr_t.numpy()
 
-                red_bones_orig, red_bones_corr = set(), set()
-
-                for cap1, cap2, p1, c1, p2, c2 in TEST_PAIRS:
-                    dist_orig = physics_engine.capsule_distance(
-                        pos_orig_t[BONE_MAP[p1]], pos_orig_t[BONE_MAP[c1]], 
-                        pos_orig_t[BONE_MAP[p2]], pos_orig_t[BONE_MAP[c2]]
-                    ).item() 
-                    if dist_orig < 0.1:
-                        red_bones_orig.update(CAPSULE_BONES[cap1]); red_bones_orig.update(CAPSULE_BONES[cap2])
-                    
-                    dist_corr = physics_engine.capsule_distance(
-                        pos_corr_t[BONE_MAP[p1]], pos_corr_t[BONE_MAP[c1]], 
-                        pos_corr_t[BONE_MAP[p2]], pos_corr_t[BONE_MAP[c2]]
-                    ).item()
-                    if dist_corr < 0.1: 
-                        red_bones_corr.update(CAPSULE_BONES[cap1]); red_bones_corr.update(CAPSULE_BONES[cap2])
+                # 물리 엔진과 동일 기준의 침투 깊이 → 색 강도/패널 수치에 반영
+                depths_orig = pair_penetrations(pos_orig_t)
+                depths_corr = pair_penetrations(pos_corr_t)
+                set_panel_text(txt_orig, depths_orig)
+                set_panel_text(txt_corr, depths_corr)
 
                 for i, (parent_name, child_name) in enumerate(bones_to_draw):
                     p_idx, c_idx = BONE_MAP[parent_name], BONE_MAP[child_name]
 
-                    # 왼쪽
+                    # 시각화 배열로 위치 지정 (이미 Z-Up으로 맞춰져 있음)
                     po_p, po_c = pos_orig_np[p_idx], pos_orig_np[c_idx]
-                    orig_color = 'red' if child_name in red_bones_orig else 'dimgray'
+                    bone_col, cap_col, cap_alpha = depth_style(
+                        depths_orig.get(child_name, 0.0), 'dimgray', 'salmon')
                     lines_orig_bone[i].set_data([po_p[0], po_c[0]], [po_p[1], po_c[1]])
                     lines_orig_bone[i].set_3d_properties([po_p[2], po_c[2]])
-                    lines_orig_bone[i].set_color(orig_color)
+                    lines_orig_bone[i].set_color(bone_col)
                     lines_orig_capsule[i].set_data([po_p[0], po_c[0]], [po_p[1], po_c[1]])
                     lines_orig_capsule[i].set_3d_properties([po_p[2], po_c[2]])
-                    lines_orig_capsule[i].set_color('red' if child_name in red_bones_orig else 'salmon')
-                    lines_orig_capsule[i].set_alpha(0.4 if child_name in red_bones_orig else 0.15)
+                    lines_orig_capsule[i].set_color(cap_col)
+                    lines_orig_capsule[i].set_alpha(cap_alpha)
 
-                    # 오른쪽
                     pc_p, pc_c = pos_corr_np[p_idx], pos_corr_np[c_idx]
-                    corr_color = 'red' if child_name in red_bones_corr else 'dodgerblue'
+                    bone_col, cap_col, cap_alpha = depth_style(
+                        depths_corr.get(child_name, 0.0), 'dodgerblue', 'dodgerblue')
                     lines_corr_bone[i].set_data([pc_p[0], pc_c[0]], [pc_p[1], pc_c[1]])
                     lines_corr_bone[i].set_3d_properties([pc_p[2], pc_c[2]])
-                    lines_corr_bone[i].set_color(corr_color)
+                    lines_corr_bone[i].set_color(bone_col)
                     lines_corr_capsule[i].set_data([pc_p[0], pc_c[0]], [pc_p[1], pc_c[1]])
                     lines_corr_capsule[i].set_3d_properties([pc_p[2], pc_c[2]])
-                    lines_corr_capsule[i].set_color('red' if child_name in red_bones_corr else 'dodgerblue')
-                    lines_corr_capsule[i].set_alpha(0.4 if child_name in red_bones_corr else 0.15)
+                    lines_corr_capsule[i].set_color(cap_col)
+                    lines_corr_capsule[i].set_alpha(cap_alpha)
 
-                return lines_orig_bone + lines_orig_capsule + lines_corr_bone + lines_corr_capsule
+                return lines_orig_bone + lines_orig_capsule + lines_corr_bone + lines_corr_capsule + [txt_orig, txt_corr]
 
-            ani = animation.FuncAnimation(fig, update_compare, frames=motion_orig.shape[0], interval=50, blit=False)
-
-            def on_mouse_move(event):
-                if event.inaxes == ax1:
-                    ax2.view_init(elev=ax1.elev, azim=ax1.azim)
-                    fig.canvas.draw_idle()
-                elif event.inaxes == ax2:
-                    ax1.view_init(elev=ax2.elev, azim=ax2.azim)
-                    fig.canvas.draw_idle()
-            fig.canvas.mpl_connect('motion_notify_event', on_mouse_move)
-
-            from matplotlib.widgets import Button
-            plt.subplots_adjust(bottom=0.15)
-            ax_play = plt.axes([0.45, 0.05, 0.1, 0.05])
-            btn_play = Button(ax_play, 'Pause', hovercolor='0.9')
-            is_playing = [True]
-
-            def toggle_play(event=None):
-                if is_playing[0]:
-                    ani.pause()
-                    btn_play.label.set_text('Play (Space)')
-                else:
-                    ani.resume()
-                    btn_play.label.set_text('Pause (Space)')
-                is_playing[0] = not is_playing[0]
-                fig.canvas.draw_idle()
-            btn_play.on_clicked(toggle_play)
-
-            def on_key_press(event):
-                if event.key == ' ':
-                    toggle_play()
-            fig.canvas.mpl_connect('key_press_event', on_key_press)
-            
-            def on_scroll(event):
-                scale_factor = 0.9 if event.button == 'up' else 1.1
-                for ax in [ax1, ax2]:
-                    ax.set_xlim([x * scale_factor for x in ax.get_xlim()])
-                    ax.set_ylim([y * scale_factor for y in ax.get_ylim()])
-                    ax.set_zlim([z * scale_factor for z in ax.get_zlim()])
-                fig.canvas.draw_idle()
-            fig.canvas.mpl_connect('scroll_event', on_scroll)
+            ani = FuncAnimation(fig, update_compare, frames=motion_orig.shape[0], interval=50, blit=False)
+            if SAVE_ANIMATION_PATH:
+                ani.save(SAVE_ANIMATION_PATH, writer='pillow', fps=20)
+                print(f"애니메이션 저장 완료: {SAVE_ANIMATION_PATH}")
             plt.show()

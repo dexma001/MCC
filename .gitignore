@@ -1,5 +1,7 @@
 #가중치
 *.pth
+checkpoints
+*_results
 
 # Data with Pytorch Module
 *.pt
