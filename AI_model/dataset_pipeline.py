@@ -137,6 +137,62 @@ def get_pos_tensor(frame_tensor_87, offsets):
     return pos_tensor
 
 # ============================================================
+# 관찰 전용 뷰어 컨트롤 (VISUALIZE 모드 전용 — 학습 코드와 의존성 없음)
+# ============================================================
+def attach_viewer_controls(fig, ani, axes_3d):
+    """
+    matplotlib 애니메이션 뷰어에 관찰용 컨트롤을 붙인다 (SINGLE/COMPARE 공용).
+      - Pause/Resume 버튼 (+ 스페이스바 단축키): 충돌이 일어나는 프레임을
+        정지 상태로 자세히 관찰할 수 있다.
+      - 마우스 스크롤: 3D 패널 확대/축소. 패널이 여러 개면(COMPARE) 두 패널을
+        함께 줌하여 Before/After 비교 시점을 유지한다. 축소는 스크롤 다운.
+    순수 matplotlib 이벤트만 사용한다 — 모델/학습 코드와 무관한 관찰 파트이므로
+    어떤 학습 모듈도 import 하지 않는다 (위젯 import도 이 함수 안에서만).
+    반환된 버튼 객체는 호출 측이 변수로 보관해야 콜백이 GC로 사라지지 않는다.
+    """
+    from matplotlib.widgets import Button
+
+    state = {'paused': False}
+    btn_ax = fig.add_axes([0.46, 0.02, 0.10, 0.05])   # 그림 하단 중앙
+    btn = Button(btn_ax, 'Pause')
+
+    def toggle_pause(_event=None):
+        # FuncAnimation의 타이머(event_source)만 멈추고 살린다 — 정지 중에도
+        # 스크롤 줌/시점 회전 등 다른 상호작용은 그대로 동작한다.
+        if state['paused']:
+            ani.event_source.start()
+        else:
+            ani.event_source.stop()
+        state['paused'] = not state['paused']
+        btn.label.set_text('Resume' if state['paused'] else 'Pause')
+        fig.canvas.draw_idle()
+
+    def on_key(event):
+        if event.key == ' ':
+            toggle_pause()
+
+    def on_scroll(event):
+        # 3D 패널 위에서 굴릴 때만 동작 (버튼/여백 위 스크롤은 무시)
+        if event.inaxes not in axes_3d:
+            return
+        factor = 0.9 if event.button == 'up' else 1.1
+        for ax in axes_3d:   # COMPARE: 두 패널 동기 줌 (같은 배율 유지)
+            for get_lim, set_lim in ((ax.get_xlim3d, ax.set_xlim3d),
+                                     (ax.get_ylim3d, ax.set_ylim3d),
+                                     (ax.get_zlim3d, ax.set_zlim3d)):
+                lo, hi = get_lim()
+                center = (lo + hi) / 2.0
+                half = (hi - lo) / 2.0 * factor
+                set_lim(center - half, center + half)
+        fig.canvas.draw_idle()
+
+    btn.on_clicked(toggle_pause)
+    fig.canvas.mpl_connect('key_press_event', on_key)
+    fig.canvas.mpl_connect('scroll_event', on_scroll)
+    return btn
+
+
+# ============================================================
 # Train / Test 분할 (과적합 검증용 held-out set)
 # ============================================================
 # 모든 스크립트(train / evaluate / inference)가 동일한 결정론적 분할을 공유하도록
@@ -170,11 +226,16 @@ def get_split_files(pt_dir, split='train', val_ratio=VAL_RATIO, seed=SPLIT_SEED)
 # 가중치 파일 / run_config.json / log.txt 를 격리한다. 이렇게 하면 lambda 스윕 시
 # 이전 실험 결과가 덮어써지지 않고, 폴더 이름만 봐도 어떤 설정인지 알 수 있다.
 
-def make_run_name(lambda_recon, lambda_phys, beta_kl):
-    """실험 손실 가중치를 사람이 읽기 쉬운 폴더명으로 변환. 예: recon1_phys0.5_kl0.01"""
+def make_run_name(lambda_recon, lambda_phys, beta_kl, tag=None):
+    """
+    실험 손실 가중치를 사람이 읽기 쉬운 폴더명으로 변환. 예: recon1_phys0.5_kl0.01
+    tag를 주면 접두어로 붙는다 (예: tag='declip' → declip_recon1_phys0.5_kl0.01).
+    → §4.1 디클리핑 시대의 run이 정규화 시대(무태그) 폴더와 절대 충돌하지 않게 하는 장치.
+    """
     def fmt(v):
         return f"{float(v):g}"   # 1.0 -> '1', 0.5 -> '0.5', 0.01 -> '0.01'
-    return f"recon{fmt(lambda_recon)}_phys{fmt(lambda_phys)}_kl{fmt(beta_kl)}"
+    base = f"recon{fmt(lambda_recon)}_phys{fmt(lambda_phys)}_kl{fmt(beta_kl)}"
+    return f"{tag}_{base}" if tag else base
 
 
 def resolve_ckpt_root():
@@ -206,15 +267,16 @@ def find_latest_checkpoint_in(run_dir):
     return max(ckpts, key=lambda x: int(os.path.basename(x).split('_')[2].split('.')[0]))
 
 
-def find_run_dir_by_config(lambda_recon, lambda_phys, beta_kl, ckpt_root=None):
+def find_run_dir_by_config(lambda_recon, lambda_phys, beta_kl, tag=None, ckpt_root=None):
     """
     손실 가중치 조합으로 특정 실험의 run 폴더를 직접 찾는다 (mtime이 아니라 설정으로 선택).
-    train.py에서 쓰던 값과 동일한 (recon, phys, kl)을 주면 그 실험의 폴더를 반환하므로,
+    train.py에서 쓰던 값과 동일한 (recon, phys, kl[, tag])을 주면 그 실험의 폴더를 반환하므로,
     가장 최근 실험이 아니라 '과거의 특정 실험'도 다시 평가할 수 있다.
+    (tag=None이면 구(舊) 정규화-시대 폴더를, tag='declip'이면 디클리핑-시대 폴더를 찾는다.)
     가중치(.pth)가 들어있는 해당 폴더 경로를 반환하고, 없으면 None.
     """
     ckpt_root = ckpt_root or resolve_ckpt_root()
-    run_dir = os.path.join(ckpt_root, make_run_name(lambda_recon, lambda_phys, beta_kl))
+    run_dir = os.path.join(ckpt_root, make_run_name(lambda_recon, lambda_phys, beta_kl, tag=tag))
     if os.path.isdir(run_dir) and glob.glob(os.path.join(run_dir, "pvtvae_epoch_*.pth")):
         return run_dir
     return None
@@ -346,6 +408,8 @@ if __name__ == "__main__":
                 return lines
 
             ani = FuncAnimation(fig, update, frames=motion_py.shape[0], interval=33, blit=False)
+            # 관찰용 컨트롤: Pause/Resume 버튼(+스페이스바), 마우스 스크롤 줌
+            viewer_controls = attach_viewer_controls(fig, ani, [ax])
             plt.show()
                 
         elif VISUALIZE_TYPE == "COMPARE":
@@ -505,4 +569,6 @@ if __name__ == "__main__":
             if SAVE_ANIMATION_PATH:
                 ani.save(SAVE_ANIMATION_PATH, writer='pillow', fps=20)
                 print(f"애니메이션 저장 완료: {SAVE_ANIMATION_PATH}")
+            # 관찰용 컨트롤은 '저장 후'에 부착한다 — 발표용 gif에 버튼 UI가 찍히지 않게.
+            viewer_controls = attach_viewer_controls(fig, ani, [ax1, ax2])
             plt.show()

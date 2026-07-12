@@ -4,10 +4,11 @@ import torch
 import numpy as np
 from models import PVTVAE
 from dataset_pipeline import (PARENTS, BONE_NAMES, BONE_RADII, get_split_files,
-                              find_run_dir_by_config, find_latest_checkpoint_in, list_available_runs)
+                              make_run_name, find_run_dir_by_config, find_latest_checkpoint_in,
+                              list_available_runs)
 from physics_module import DifferentiablePhysics
-# 추론 대상 실험도 train.py의 손실 가중치로 선택한다 (과거 실험 재현 가능).
-from train import LAMBDA_RECON, LAMBDA_PHYS, BETA_KL
+# 추론 대상 실험도 train.py의 손실 가중치 + run 태그로 선택한다 (과거 실험 재현 가능).
+from train import LAMBDA_RECON, LAMBDA_PHYS, BETA_KL, RUN_TAG
 
 # 1. 환경 설정 및 디바이스 정의
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -25,11 +26,11 @@ def inference():
     # 2. 폴더 경로 탐색 (자동 감지)
     motions_dir = "../processed_motions_VMC" if os.path.exists("../processed_motions_VMC") else "processed_motions_VMC"
 
-    # train.py에 설정된 손실 가중치와 일치하는 run 폴더에서 마지막 epoch 가중치를 선택한다.
-    run_dir = find_run_dir_by_config(LAMBDA_RECON, LAMBDA_PHYS, BETA_KL)
+    # train.py에 설정된 손실 가중치/태그와 일치하는 run 폴더에서 마지막 epoch 가중치를 선택한다.
+    run_dir = find_run_dir_by_config(LAMBDA_RECON, LAMBDA_PHYS, BETA_KL, tag=RUN_TAG)
     CHECKPOINT_PATH = find_latest_checkpoint_in(run_dir) if run_dir else None
     if not CHECKPOINT_PATH:
-        target = f"recon{LAMBDA_RECON:g}_phys{LAMBDA_PHYS:g}_kl{BETA_KL:g}"
+        target = make_run_name(LAMBDA_RECON, LAMBDA_PHYS, BETA_KL, tag=RUN_TAG)
         raise FileNotFoundError(
             f"설정과 일치하는 가중치 폴더(checkpoints/{target}/)를 찾을 수 없습니다.\n"
             f"사용 가능한 실험 폴더: {list_available_runs()}\n"

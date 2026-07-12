@@ -1,143 +1,164 @@
+"""
+발표용 데모 생성기 (§4.1 디클리핑 시대판).
+
+학습(train.py)·평가(evaluate.py)와 동일한 corruption.py 주입기로 held-out 테스트
+파일에 클리핑을 주입하고, train.py 설정(LAMBDA_*/RUN_TAG)과 일치하는 run 폴더의
+체크포인트로 교정한 결과를 demo_results/ 에 저장한다.
+→ 이후 'python AI_model/dataset_pipeline.py' (VISUALIZE=COMPARE)로 시각화.
+
+[구판과의 차이 — §4.1 반영]
+  - 주입: 구판의 'LeftUpperArm 로컬 +Z 90° 고정' 주입은 §4.1 학습 분포에서
+    의도적으로 제외된 계열(오염 검사용 legacy80의 초과판)이라 디클리핑 모델의
+    최악 OOD 사례만 보여줬다 (실측 2026-07-09: 침투 7.25 → 9.2cm 악화).
+    이제 학습/평가와 동일한 corruption.py 주입기(transient/persistent)를 쓴다.
+  - 체크포인트: 하드코딩 경로 대신 evaluate.py와 동일한 설정 기반 선택
+    (find_run_dir_by_config + RUN_TAG). train.py의 람다를 바꾸면 그 실험이 데모된다.
+  - 소스 파일: 전체 파일이 아니라 held-out 테스트 분할에서만 추첨한다
+    (학습에 본 적 없는 데이터라는 정직한 데모).
+  - 주입이 충돌을 만들지 못하면 다른 파일로 재추첨한다 (2026-07-06 실증:
+    같은 회전도 포즈에 따라 충돌 0이 될 수 있음 → rejection sampling 필수).
+"""
 import os
-import glob
 import json
 import datetime
+import random
 import torch
-import numpy as np
-from scipy.spatial.transform import Rotation as R
 
 from models import PVTVAE
-from dataset_pipeline import BONE_NAMES, BONE_MAP, PARENTS, BONE_RADII
+from dataset_pipeline import (PARENTS, BONE_RADII, get_split_files,
+                              make_run_name, find_run_dir_by_config,
+                              find_latest_checkpoint_in, list_available_runs)
 from physics_module import DifferentiablePhysics
+import corruption
+# 데모 대상 실험은 train.py의 설정으로 선택 (evaluate.py와 동일한 방식 — mtime 아님)
+from train import LAMBDA_RECON, LAMBDA_PHYS, BETA_KL, RUN_TAG, COLLIDING_PAIRS
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 SEQ_LEN = 30
 
-# 주입 파라미터 (발표 데모용 — demo_results/demo_meta.json에 기록되어 동일 데모 재생성 가능)
-INJECT_BONE = 'LeftUpperArm'
-INJECT_AXIS = [0.0, 0.0, 1.0]     # 상박 로컬 Z축 기준 스윙(어덕션)
-INJECT_MAX_DEG = 90.0
-INJECT_FRAME_RANGE = (10, 25)     # [시작, 끝) 프레임 — sin 곡선으로 0 → 최대 → 0
+# =====================================================================
+# 데모 파라미터 — demo_results/demo_meta.json 에 기록되어 동일 데모 재생성 가능
+# =====================================================================
+DEMO_SCENARIO = 'persistent'    # 'transient'(글리치 복원) 또는 'persistent'(최소 사영)
+DEMO_SEED = random.randrange(0, 4000)           # 파일/주입 추첨 시드 — 바꾸면 다른 데모가 나온다
+TARGET_FILE = ""               # 지정 시 해당 .pt 파일 고정 (재현용), 빈 문자열 = 추첨
+DEMO_MIN_DEPTH_CM = 2.0        # 화면에서 잘 보이는 최소 주입 깊이 — 미달 시 파일 재추첨
+MAX_FILE_TRIES = 30            # 재추첨 상한 (초과 시 그때까지 최선의 후보 사용)
 
-# 주입 대상 뼈의 로컬 쿼터니언 슬라이스 (87차원 텐서 기준: 앞 3 = Hips Pos)
-INJ_IDX = BONE_MAP[INJECT_BONE]
-INJ_SLICE = slice(3 + INJ_IDX * 4, 3 + INJ_IDX * 4 + 4)
+# 주입 '형태'는 학습/평가와 동일한 설계 기본값. 단 transient의 최소 깊이 하한만
+# 데모 가시성 기준(DEMO_MIN_DEPTH_CM)으로 올린다 — 주입기 내부 재추첨이 깊은
+# 충돌을 우선 채택하게 될 뿐, 각도/길이 분포(U[15°,70°], 5~20프레임)는 그대로다.
+DEMO_CFG = corruption.make_cfg(transient_min_depth_cm=max(0.3, DEMO_MIN_DEPTH_CM))
 
 
-def create_extreme_demo():
-    print("[발표용 데모 생성기] 극단적 클리핑 데이터 시뮬레이션을 시작합니다...")
+def create_demo():
+    print(f"[발표용 데모 생성기] §4.1 디클리핑 데모 — scenario='{DEMO_SCENARIO}'")
 
-    # 1. Trained Model (새 양식: 입력 87, 출력 84 쿼터니언)
-    model = PVTVAE(input_dim=87, output_dim=84, latent_dim=64).to(DEVICE)
-    ckpt_path = r"training_epoch_100_results/recon1_phys0.1_kl0.01/pvtvae_epoch_100.pth"
-    if not os.path.exists(ckpt_path):
-        print("가중치 파일을 찾을 수 없습니다.")
+    # 1. 체크포인트: train.py 설정과 일치하는 run 폴더에서 최신 epoch 가중치 로드
+    run_dir = find_run_dir_by_config(LAMBDA_RECON, LAMBDA_PHYS, BETA_KL, tag=RUN_TAG)
+    if run_dir is None:
+        target = make_run_name(LAMBDA_RECON, LAMBDA_PHYS, BETA_KL, tag=RUN_TAG)
+        print(f"❌ 설정과 일치하는 학습 폴더(checkpoints/{target}/)를 찾을 수 없습니다.")
+        avail = list_available_runs()
+        if avail:
+            print(f"   사용 가능한 실험 폴더: {avail}")
+            print("   → train.py의 LAMBDA_*/DECLIP_MODE를 위 이름 중 하나에 맞춰 다시 실행하세요.")
         return
+    ckpt_path = find_latest_checkpoint_in(run_dir)
+
+    model = PVTVAE(input_dim=87, output_dim=84, latent_dim=64).to(DEVICE)
     model.load_state_dict(torch.load(ckpt_path, map_location=DEVICE))
     model.eval()
+    print(f"✅ 모델 로드: {os.path.relpath(ckpt_path)}")
 
-    # 2. 대상 데이터 (새 양식 [Frames, 87]) — 주입 구간/모델 입력을 위해 30프레임 이상만 사용
-    target_file = "" #"processed_motions_VMC/dataset-2_run_active_029.pt"
-    if target_file and os.path.exists(target_file):
-        full_motion = torch.load(target_file)
-        if full_motion.shape[0] < SEQ_LEN:
-            print(f"지정 파일의 프레임 수({full_motion.shape[0]})가 {SEQ_LEN} 미만입니다.")
-            return
-    else:
-        cands = glob.glob("processed_motions_VMC/*.pt") or glob.glob("../processed_motions_VMC/*.pt")
-        np.random.shuffle(cands)
-        full_motion = None
-        for cand in cands:
-            t = torch.load(cand)
-            if t.shape[0] >= SEQ_LEN:
-                target_file, full_motion = cand, t
-                break
-        if full_motion is None:
-            print(f"{SEQ_LEN}프레임 이상인 .pt 파일을 찾지 못했습니다.")
-            return
-    print(target_file)
-
-    original_motion = full_motion[:SEQ_LEN].clone()  # [30, 87]
-
-    # 3. 클리핑 버그 주입: INJECT_BONE 로컬 회전을 몸통 안쪽으로 강제로 꺾는다.
-    #    (관절별 위치가 없는 새 양식에서는 쿼터니언만 수정 → FK가 하박/손까지 자동 전파)
-    demo_motion = original_motion.clone()
-    swing_axis = np.array(INJECT_AXIS)
-    f_start, f_end = INJECT_FRAME_RANGE
-
-    for f in range(f_start, f_end):
-        ratio = np.sin((f - f_start) / float(f_end - f_start) * np.pi)   # 0 -> 1 -> 0 부드러운 곡선
-        angle_deg = INJECT_MAX_DEG * ratio
-        delta = R.from_rotvec(swing_axis * np.radians(angle_deg))
-
-        q_local = demo_motion[f, INJ_SLICE].numpy()          # [qx,qy,qz,qw]
-        q_new = (R.from_quat(q_local) * delta).as_quat()     # 로컬 프레임에서 추가 회전
-        demo_motion[f, INJ_SLICE] = torch.tensor(q_new, dtype=demo_motion.dtype)
-
-    # 3-1. 주입된 클리핑이 실제로 충돌을 만드는지 물리 엔진으로 확인
-    #      (시각화 COMPARE 모드의 TEST_PAIRS와 동일한 4개 모니터링 페어 — 수치/화면 일치 보장)
     physics = DifferentiablePhysics(PARENTS, BONE_RADII)
-    COLLIDING_PAIRS = [
-        (('Hips', 'Chest'), ('LeftLowerArm', 'LeftHand')),
-        (('Hips', 'Chest'), ('RightLowerArm', 'RightHand')),
-        (('LeftLowerArm', 'LeftHand'), ('RightLowerArm', 'RightHand')),
-        (('LeftLowerLeg', 'LeftFoot'), ('RightLowerLeg', 'RightFoot')),
-    ]
 
     def depth_report(motion_87):
-        """프레임별 최대 침투 깊이(cm) 시계열과 (최대 깊이, 충돌 프레임 수)를 반환."""
+        """프레임별 최대 침투 깊이(cm) → (최대 깊이 cm, 충돌 프레임 수). 시각화와 동일 4페어."""
         dep = physics.get_penetration_depths_from_quats(
             motion_87[:, :3], motion_87[:, 3:], COLLIDING_PAIRS) * 100.0   # [F, P] cm
-        fmax = dep.max(dim=1).values                                       # [F]
-        return fmax, float(fmax.max()), int((fmax > 1e-4).sum())
+        fmax = dep.max(dim=1).values
+        return float(fmax.max()), int((fmax > 1e-4).sum())
 
-    inj = physics.get_collision_loss_from_quats(
-        demo_motion[:, :3], demo_motion[:, 3:], COLLIDING_PAIRS).item()
-    _, maxpen_b, ncoll_b = depth_report(demo_motion)
-    print(f"주입된 충돌(Before): 최대 침투 {maxpen_b:.2f} cm | 충돌 프레임 {ncoll_b}/{demo_motion.shape[0]} | loss={inj:.6f}")
+    # 2. 소스 모션: held-out 테스트 분할에서 추첨, 주입이 목표 깊이의 충돌을 만들 때까지
+    #    파일을 재추첨한다 (rejection sampling — 주입은 포즈에 따라 무충돌일 수 있음).
+    motions_dir = "processed_motions_VMC" if os.path.exists("processed_motions_VMC") \
+        else "../processed_motions_VMC"
+    inject_fn = corruption.inject_transient if DEMO_SCENARIO == 'transient' \
+        else corruption.inject_persistent
+    min_depth = DEMO_MIN_DEPTH_CM if DEMO_SCENARIO == 'transient' else 1.0
 
-    # 4. AI 교정 (Inference)
-    input_tensor = demo_motion.unsqueeze(0).to(DEVICE)  # [1, 30, 87]
+    if TARGET_FILE:
+        cands = [TARGET_FILE]
+    else:
+        cands = get_split_files(motions_dir, split='test')
+        random.Random(DEMO_SEED).shuffle(cands)
+
+    chosen = None   # (파일, 클린 원본, 손상본, 주입 meta)
+    best = None     # 전 후보 실패 시의 차선 (가장 깊은 충돌)
+    for try_i, fpath in enumerate(cands[:MAX_FILE_TRIES]):
+        full = torch.load(fpath)
+        if full.shape[0] < SEQ_LEN:
+            continue
+        clean = full[:SEQ_LEN].clone()                                # [30, 87]
+        rng = random.Random(DEMO_SEED + 10007 * try_i)
+        corrupted, meta = inject_fn(clean, physics, DEMO_CFG, rng, COLLIDING_PAIRS)
+        depth = meta.get('max_depth_cm', 0.0)
+        if meta.get('collided') and depth >= min_depth:
+            chosen = (fpath, clean, corrupted, meta)
+            break
+        if meta.get('collided') and (best is None or depth > best[3]['max_depth_cm']):
+            best = (fpath, clean, corrupted, meta)
+    if chosen is None:
+        if best is None:
+            print(f"❌ {MAX_FILE_TRIES}개 파일 모두 주입이 충돌을 만들지 못했습니다. "
+                  f"DEMO_SEED를 바꿔 다시 시도하세요.")
+            return
+        chosen = best
+        print(f"⚠️ 목표 깊이 {min_depth}cm 이상 실패 — 가장 깊은 후보로 진행합니다.")
+    target_file, _clean_motion, demo_motion, inject_meta = chosen
+    print(f"소스 파일(held-out): {target_file}")
+    print(f"주입: {inject_meta['type']} | bone={inject_meta['bone']} | "
+          f"frames={inject_meta['frames']} | depth={inject_meta['max_depth_cm']:.2f} cm")
+
+    maxpen_b, ncoll_b = depth_report(demo_motion)
+    print(f"주입된 충돌(Before): 최대 침투 {maxpen_b:.2f} cm | 충돌 프레임 {ncoll_b}/{demo_motion.shape[0]}")
+
+    # 3. AI 교정 (Inference)
     with torch.no_grad():
-        recon_motion, _, _ = model(input_tensor)
-    corrected_motion = recon_motion.squeeze(0).cpu()    # [30, 87]
+        recon_motion, _, _ = model(demo_motion.unsqueeze(0).to(DEVICE))
+    corrected_motion = recon_motion.squeeze(0).cpu()                  # [30, 87]
 
-    corr_col = physics.get_collision_loss_from_quats(
-        corrected_motion[:, :3], corrected_motion[:, 3:], COLLIDING_PAIRS).item()
-    _, maxpen_a, ncoll_a = depth_report(corrected_motion)
-    print(f"교정 후 충돌(After) : 최대 침투 {maxpen_a:.2f} cm | 충돌 프레임 {ncoll_a}/{corrected_motion.shape[0]} | loss={corr_col:.6f}")
+    maxpen_a, ncoll_a = depth_report(corrected_motion)
+    print(f"교정 후 충돌(After) : 최대 침투 {maxpen_a:.2f} cm | 충돌 프레임 {ncoll_a}/{corrected_motion.shape[0]}")
 
-    # 5. 시각화/평가 툴이 읽도록 동일 이름으로 저장 ([30, 87])
-    os.makedirs("demo_results", exist_ok=True)
-    torch.save(demo_motion, "demo_results/sample_original.pt")
-    torch.save(corrected_motion, "demo_results/sample_corrected.pt")
+    # 4. 시각화 툴이 읽도록 저장 ([30, 87]) — Before = 손상 입력, After = 모델 출력
+    results_dir = "demo_results" if os.path.exists("processed_motions_VMC") else "../demo_results"
+    os.makedirs(results_dir, exist_ok=True)
+    torch.save(demo_motion, os.path.join(results_dir, "sample_original.pt"))
+    torch.save(corrected_motion, os.path.join(results_dir, "sample_corrected.pt"))
 
-    # 5-1. 데모 재현용 메타데이터 저장: 어떤 파일/가중치/주입 설정으로 만든 데모인지 기록
-    #      (발표에서 잘 나온 데모를 나중에 target_file 고정으로 그대로 재생성할 수 있다)
+    # 4-1. 데모 재현용 메타데이터: 어떤 파일/가중치/주입으로 만든 데모인지 기록
+    #      (잘 나온 데모는 TARGET_FILE + DEMO_SEED 고정으로 그대로 재생성 가능)
     meta = {
         "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "source_file": str(target_file),
+        "source_split": "test (held-out)" if not TARGET_FILE else "manual",
         "checkpoint": ckpt_path,
         "seq_len": SEQ_LEN,
-        "inject": {
-            "bone": INJECT_BONE,
-            "local_axis": INJECT_AXIS,
-            "max_deg": INJECT_MAX_DEG,
-            "frame_range": list(INJECT_FRAME_RANGE),
-            "profile": "sin(0 -> max -> 0)",
-        },
-        "collision_before": round(inj, 6),
-        "collision_after": round(corr_col, 6),
+        "demo_scenario": DEMO_SCENARIO,
+        "demo_seed": DEMO_SEED,
+        "inject": inject_meta,
         "max_pen_before_cm": round(maxpen_b, 2),
         "max_pen_after_cm": round(maxpen_a, 2),
         "collision_frames_before": ncoll_b,
         "collision_frames_after": ncoll_a,
     }
-    with open("demo_results/demo_meta.json", "w", encoding="utf-8") as f:
+    with open(os.path.join(results_dir, "demo_meta.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2, ensure_ascii=False)
 
-    print("준비 완료! 이제 'python dataset_pipeline.py' (VISUALIZE=COMPARE)로 결과를 확인하세요.")
+    print("준비 완료! 이제 'python AI_model/dataset_pipeline.py' (VISUALIZE=COMPARE)로 결과를 확인하세요.")
 
 
 if __name__ == "__main__":
-    create_extreme_demo()
+    create_demo()
