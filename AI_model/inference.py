@@ -2,7 +2,8 @@ import os
 import glob
 import torch
 import numpy as np
-from models import PVTVAE
+# 기본 아키텍처(TransformerDenoiser) — Compat 어댑터로 (out, mu, logvar) 3-튜플 시그니처 유지.
+from models import TransformerDenoiserCompat
 from dataset_pipeline import (PARENTS, BONE_NAMES, BONE_RADII, get_split_files,
                               make_run_name, find_run_dir_by_config, find_latest_checkpoint_in,
                               list_available_runs)
@@ -38,7 +39,7 @@ def inference():
     print(f"📦 가중치 로드: {os.path.relpath(CHECKPOINT_PATH)}")
 
     # 3. 학습한 Model (새 양식: 입력 87, 출력 84 쿼터니언)
-    model = PVTVAE(input_dim=87, output_dim=84, latent_dim=64).to(DEVICE)
+    model = TransformerDenoiserCompat(input_dim=87, output_dim=84, latent_dim=64).to(DEVICE)
     model.load_state_dict(torch.load(CHECKPOINT_PATH, map_location=DEVICE))
     model.eval() # 평가(Inference) 모드로 전환
     print("성공: Trained model loaded.")

@@ -13,7 +13,10 @@ from scipy.spatial.transform import Rotation as R
 from dataset_pipeline import (PARENTS, BONE_NAMES, BONE_MAP, BONE_RADII, get_split_files,
                               make_run_name, find_run_dir_by_config, find_latest_checkpoint_in,
                               list_available_runs)
-from models import PVTVAE
+# 기본 아키텍처 모델을 '아키텍처 중립' 심볼(MODEL_CLASS)로 로드한다.
+# → PVTVAE_baseline/evaluate.py 같은 위성 진입점이 이 심볼 하나만 바꿔치기하면
+#   같은 평가 스위트를 다른 아키텍처로 재사용할 수 있다 (평가 방법론은 바이트 단위로 동일).
+from models import TransformerDenoiserCompat as MODEL_CLASS
 from physics_module import DifferentiablePhysics
 import corruption
 # 평가 대상 실험은 train.py에 설정된 손실 가중치 + run 태그로 선택한다 (mtime이 아니라 설정 기반).
@@ -218,7 +221,7 @@ def evaluate(scenarios=None, limit=0):
         return
     ckpt_path = find_latest_checkpoint_in(run_dir)
 
-    model = PVTVAE(input_dim=87, output_dim=84, latent_dim=64).to(DEVICE)
+    model = MODEL_CLASS(input_dim=87, output_dim=84, latent_dim=64).to(DEVICE)
     model.load_state_dict(torch.load(ckpt_path, map_location=DEVICE))
     model.eval()  # 결정론적 추론(mu 사용)
     print(f"✅ 모델 로드: {os.path.relpath(ckpt_path)}")
@@ -370,7 +373,7 @@ def _eval_one_scenario(scenario, model, physics_engine, ALL_PAIRS, test_files,
                    scenario, "vs 클린 정답 (지속형에서는 참고 수치)")
 
     print("\n" + "=" * 60)
-    print(f"PVTVAE Held-out 테스트셋 집계 — scenario='{scenario}'")
+    print(f"Held-out 테스트셋 집계 — scenario='{scenario}'  (arch={MODEL_CLASS.__name__})")
     print("=" * 60)
     print(f"  [실험 설정] tag={run_tag} | LAMBDA_RECON = {lam_recon} | LAMBDA_PHYS = {lam_phys}")
     print(f"  [평가 규모] held-out 테스트 파일 {n_used}개 (각 앞 {SEQ_LEN}프레임)")
@@ -443,7 +446,7 @@ def _eval_one_scenario(scenario, model, physics_engine, ALL_PAIRS, test_files,
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="PVTVAE held-out 테스트셋 유형별 시나리오 평가")
+    parser = argparse.ArgumentParser(description="기본 아키텍처 held-out 테스트셋 유형별 시나리오 평가")
     parser.add_argument("--corrupt", action="store_true",
                         help="(구형 호환) legacy80 시나리오만 실행")
     parser.add_argument("--scenarios", type=str, default="",

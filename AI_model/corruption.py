@@ -123,6 +123,32 @@ def _apply_local_delta(window, bone_idx, frames, axis, angles_rad):
     return out
 
 
+def _apply_local_delta_multi(window, bone_idx, frames, axis_angles_list):
+    """
+    window [S, 87] '하나'에 대해 (축, 각도열) 후보 K개를 배치 연산 한 번으로 적용 → [K, S, 87].
+    후보별 _apply_local_delta 반복 호출과 원소별 연산이 동일해 결과가 비트 단위로 같다
+    (2026-07-13 A/B 검증). 프로파일 결과 후보 생성이 corrupt_batch 시간의 ~47%였고
+    (배치당 ~370회 × 0.17ms), 그 비용이 텐서 크기가 아니라 호출 횟수에 비례했기 때문에
+    K개 후보(지속형 사다리 12개 등)를 한 번에 만드는 것이 핵심 절감이다.
+    """
+    K = len(axis_angles_list)
+    sl = slice(3 + bone_idx * 4, 3 + bone_idx * 4 + 4)
+    dev, dt = window.device, window.dtype
+
+    out = window.unsqueeze(0).repeat(K, 1, 1)                     # [K, S, 87]
+    ang = torch.tensor([aa[1] for aa in axis_angles_list], dtype=dt, device=dev)  # [K, n]
+    ax = torch.tensor([aa[0] for aa in axis_angles_list], dtype=dt, device=dev)   # [K, 3]
+    half = ang * 0.5
+    deltas = torch.cat([ax.unsqueeze(1) * torch.sin(half).unsqueeze(-1),
+                        torch.cos(half).unsqueeze(-1)], dim=-1)   # [K, n, 4]
+
+    idx = torch.tensor(frames, dtype=torch.long, device=dev)
+    q = out[:, idx, sl]                                           # [K, n, 4]
+    qn = _quat_mul(q, deltas)
+    out[:, idx, sl] = qn / (qn.norm(dim=-1, keepdim=True) + 1e-8)
+    return out
+
+
 def _depths_batched(windows, physics, pairs):
     """
     후보 윈도우 묶음 [M, S, 87]의 윈도우별 최대 선형 관통 깊이(cm) [M] 반환.
@@ -169,8 +195,11 @@ def _inject_transient_group(windows, physics, cfg, rng, pairs):
 
             # 축 방향이 몸 바깥쪽일 수 있으므로 ±axis 두 후보를 같은 라운드에 평가
             # (θ 분포 자체는 설계값 U[15°,70°] 유지; 방향만 보정)
-            for ax in (axis, [-a for a in axis]):
-                cands.append(_apply_local_delta(windows[j], BONE_MAP[bone], frames, ax, angles))
+            ax_list = (axis, [-a for a in axis])
+            multi = _apply_local_delta_multi(windows[j], BONE_MAP[bone], frames,
+                                             [(ax, angles) for ax in ax_list])
+            for k, ax in enumerate(ax_list):
+                cands.append(multi[k])
                 owners.append(j)
                 cmetas.append(dict(type='transient', bone=bone, bone_idx=BONE_MAP[bone],
                                    frames=(f0, f1), theta_peak_deg=round(theta_peak, 2),
@@ -252,12 +281,14 @@ def _inject_persistent_group(windows, physics, cfg, rng, pairs):
                 axes = (axis, [-a for a in axis])
                 p['draws'] += 1
             p['last_draw'] = (bone,)
-            for ax in axes:
-                for theta in angle_list:
-                    cands.append(_apply_local_delta(
-                        windows[j], BONE_MAP[bone], frames, ax, [math.radians(theta)] * len(frames)))
-                    owners.append(id(p))
-                    cmetas.append(dict(bone=bone, axis=ax, theta=theta, frames=(f0, f1), seg=seg))
+            combos = [(ax, theta) for ax in axes for theta in angle_list]
+            multi = _apply_local_delta_multi(
+                windows[j], BONE_MAP[bone], frames,
+                [(ax, [math.radians(theta)] * len(frames)) for ax, theta in combos])
+            for k, (ax, theta) in enumerate(combos):
+                cands.append(multi[k])
+                owners.append(id(p))
+                cmetas.append(dict(bone=bone, axis=ax, theta=theta, frames=(f0, f1), seg=seg))
 
         depths = _depths_batched(torch.stack(cands), physics, pairs)
 
@@ -348,3 +379,47 @@ def corrupt_batch(clean_batch, physics, cfg, rng, pairs):
             out[i] = w
             metas[i] = m
     return out, metas
+
+
+# ------------------------------------------------------------------
+# 학습 루프용 백그라운드 프리페치 (파이프라인 병렬화)
+# ------------------------------------------------------------------
+def corrupted_batches(dataloader, physics, cfg, rng, pairs, prefetch=2):
+    """
+    DataLoader 배치를 백그라운드 스레드에서 '순차적으로' 손상시켜
+    (clean_batch, corrupted_batch, metas)를 내놓는 제너레이터.
+
+    목적: 주입은 CPU 작업(배치당 ~수십 ms)이라 메인 루프에서 직접 호출하면 그 시간 동안
+    GPU가 통째로 논다. 이 제너레이터는 GPU가 배치 N을 학습하는 동안 배치 N+1의 주입을
+    준비해 주입 비용을 GPU 시간 뒤로 숨긴다 (에폭 시간 ≈ max(주입, GPU) + ε).
+
+    재현성 보장: 데이터 순회와 rng 소비가 '단일 스레드에서 순차'로 일어나므로,
+    메인 루프에서 corrupt_batch를 직접 부르던 기존 방식과 배치 순서·난수 소비 순서·
+    주입 결과가 완전히 동일하다 (연산 자체는 그대로, 실행 '시점'만 겹칠 뿐).
+    (메인 스레드는 numpy/torch CPU 전역 난수를 쓰지 않아야 한다 — 현 train.py 충족.)
+    """
+    import queue
+    import threading
+
+    q = queue.Queue(maxsize=prefetch)
+    _END = object()
+    errors = []
+
+    def _producer():
+        try:
+            for batch in dataloader:
+                corrupted, metas = corrupt_batch(batch, physics, cfg, rng, pairs)
+                q.put((batch, corrupted, metas))
+        except BaseException as e:   # 예외는 소비 측에서 다시 던진다
+            errors.append(e)
+        finally:
+            q.put(_END)
+
+    threading.Thread(target=_producer, daemon=True).start()
+    while True:
+        item = q.get()
+        if item is _END:
+            if errors:
+                raise errors[0]
+            return
+        yield item

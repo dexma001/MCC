@@ -24,7 +24,8 @@ import datetime
 import random
 import torch
 
-from models import PVTVAE
+# 기본 아키텍처(TransformerDenoiser) — Compat 어댑터로 (out, mu, logvar) 3-튜플 시그니처 유지.
+from models import TransformerDenoiserCompat
 from dataset_pipeline import (PARENTS, BONE_RADII, get_split_files,
                               make_run_name, find_run_dir_by_config,
                               find_latest_checkpoint_in, list_available_runs)
@@ -66,7 +67,7 @@ def create_demo():
         return
     ckpt_path = find_latest_checkpoint_in(run_dir)
 
-    model = PVTVAE(input_dim=87, output_dim=84, latent_dim=64).to(DEVICE)
+    model = TransformerDenoiserCompat(input_dim=87, output_dim=84, latent_dim=64).to(DEVICE)
     model.load_state_dict(torch.load(ckpt_path, map_location=DEVICE))
     model.eval()
     print(f"✅ 모델 로드: {os.path.relpath(ckpt_path)}")
