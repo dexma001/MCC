@@ -1,6 +1,7 @@
 import os
 import json
 import csv
+import time
 import argparse
 import datetime
 import random
@@ -48,6 +49,23 @@ RUN_SCENARIOS = ["clean", "legacy80", "transient", "persistent"]
 EVAL_SEED = 20260707
 EVAL_CORRUPTION_CFG = corruption.make_cfg()   # 주입 '형태' 파라미터는 설계 기본값 고정
 
+# =====================================================================
+# [항목 2] 3DPCK 임계값(cm) — 3D HPE 표준 지표(관절 정확도 통과율)를 우리 스케일에 맞춘 것.
+#   필드 표준 150mm는 우리 스케일에서 무의미하다(MPJPE가 이미 4~6cm라 전부 100%로 포화).
+#   1/2/5cm는 max_pen과 '같은 축(cm)'이라 침투 깊이와 나란히 읽힌다. 발명 상수 0개.
+#
+# 🚨 시나리오 게이팅 (설계상 필수): PCK는 '클린 정답'을 기준으로 하므로 거리에 단조인 지표다.
+#   따라서 persistent/legacy80(지속형 심층 손상)에서는 "의도적 포즈를 원래대로 되돌릴수록
+#   점수가 오르는" 역상관이 발생한다 — 제품 목표는 복원이 아니라 '최소 사영'이기 때문이다.
+#   이는 지금 헤드라인에서 강등하는 persistent MPJPE와 정확히 같은 함정이므로,
+#   PCK는 아래 두 시나리오에서만 계산하고 나머지는 CSV에 빈칸으로 남긴다.
+# =====================================================================
+PCK_THRESHOLDS_CM = (1.0, 2.0, 5.0)
+PCK_SCENARIOS = ("clean", "transient")
+
+# [항목 1] 추론 시간 측정에서 버릴 워밍업 파일 수 (CUDA 컨텍스트 생성/커널 캐싱 구간 제외)
+TIMING_WARMUP_FILES = 5
+
 
 def load_run_config(run_dir):
     """train.py가 해당 run 폴더에 남긴 실험용 lambda/주입 설정을 읽는다 (없으면 빈 dict)."""
@@ -74,7 +92,23 @@ def append_results_csv(row, csv_path="evaluate_results.csv"):
               "mae_deg_mean", "mae_deg_std",
               "intent_mae_deg",
               "jitter_before_mean", "jitter_after_mean",
-              "bonelen_after_cm_mean"]
+              "bonelen_after_cm_mean",
+              # ---- Tier 1 신규 컬럼 (2026-07-28) ----------------------------------
+              # 🚨 스키마 규칙: 신규 컬럼은 '반드시 맨 뒤에만' 추가한다. 절대 중간 삽입 금지.
+              #    evaluate_visualize.xlsx가 CSV의 '컬럼 위치'를 직접 참조해 만들어졌기 때문에,
+              #    중간에 끼워 넣으면 기존 추출 범위가 전부 어긋난다. 맨 뒤 추가면 기존 1~24열
+              #    인덱스가 보존되어 기존 시각화가 무수정으로 동작한다. (Tier 2 이후에도 동일 규칙)
+              # [항목 4] 학습이 실제 최적화하는 4쌍 한정 헤드라인 충돌 지표
+              "max_pen4_before_cm", "max_pen4_after_cm",
+              "clean_frames4_before_pct", "clean_frames4_after_pct",
+              "depth_removal4_pct",
+              # [항목 2] 3DPCK — clean/transient 시나리오에서만 기록(그 외 빈칸, 아래 게이팅 참조)
+              "pck_1cm", "pck_2cm", "pck_5cm",
+              "pck_frame_1cm", "pck_frame_2cm", "pck_frame_5cm",
+              # [항목 3] 동역학 보존 (전 시나리오 기록 — clean에서는 do-no-harm 수치가 된다)
+              "intent_dyn_cm",
+              # [항목 1] 추론 시간 (R4) — ⚠️ 배포 지연시간이 아니라 '상한 프록시'
+              "infer_ms_window_mean", "infer_ms_window_p95", "infer_ms_per_frame", "infer_device"]
     exists = os.path.exists(csv_path)
     if exists:
         with open(csv_path, "r", newline="", encoding="utf-8") as f:
@@ -143,10 +177,21 @@ def calculate_mae(motion_orig, motion_corr):
 
 def calculate_intent_mae(motion_out, motion_in, injected_bone_idx):
     """
-    [의도 보존 지표] 주입되지 '않은' 관절들에 대해 (모델 출력 vs 손상 입력)의 회전 차이(도).
-    낮을수록 좋다 — 모델이 손상 부위만 고치고 나머지 퍼포먼스는 건드리지 않았다는 뜻.
+    [부수 변화(collateral) 지표] 주입되지 '않은' 관절들에 대해 (모델 출력 vs 손상 입력)의
+    회전 차이(도). 낮을수록 좋다 — 모델이 손상 부위만 고치고 나머지는 건드리지 않았다는 뜻.
     기존 지표(클린 대비 근접도)만으로는 "팔을 홱 잡아떼고도 좋은 점수"인 과잉 보정을
-    구조적으로 볼 수 없어서 추가된 지표 (R2, 설계 문서의 필수 요구사항).
+    구조적으로 볼 수 없어서 추가된 지표 (R2).
+
+    ⚠️ 이름 주의 (2026-07-28 재정의): 이것은 '의도(intent)' 지표가 아니라 '부수 변화' 지표다.
+       측정하는 것은 "주입되지 않은 관절이 얼마나 덩달아 움직였는가"이며, 의도의 의미론이
+       아니다. 한계: (1) 정당한 협응 교정(어깨와 함께 움직여야 하는 경우)도 벌점 처리한다,
+       (2) injected_bone_idx 라벨은 '우리가 주입했기 때문에' 아는 값이라 실제 배포
+       스트림에서는 계산할 수 없다, (3) 동역학/타이밍 정보가 없다.
+       (2)(3)을 보완하는 것이 calculate_intent_dyn 이다.
+
+    📌 CSV 컬럼명은 'intent_mae_deg' 그대로 유지한다 — append_results_csv의 마이그레이션이
+       키 기반 복사(r.get(k, ""))라서 컬럼명을 바꾸면 기존 행들의 값이 조용히 소실된다.
+       따라서 개명은 '표시 라벨과 문서'에서만 수행한다.
     """
     ang = per_joint_angle_deg(motion_out, motion_in)      # [F, J]
     mask = torch.ones(len(BONE_NAMES), dtype=torch.bool)
@@ -160,6 +205,37 @@ def calculate_acceleration_jitter(global_pos):
         return 0.0
     accel = global_pos[2:] - 2 * global_pos[1:-1] + global_pos[:-2]
     return torch.norm(accel, dim=-1).mean().item() * 100.0
+
+
+def calculate_intent_dyn(gp_out, gp_in):
+    """
+    [동역학 보존 지표, R2] 출력과 '손상 입력'의 가속도 벡터 차이 평균 (cm/frame²).
+
+        intent_dyn = mean ‖Δ²(gp_out) − Δ²(gp_in)‖ × 100
+
+    위 calculate_acceleration_jitter와 연산자([1,-2,1] 시간축 2차 차분)는 완전히 같지만,
+    '한 신호의 절대 평활도'가 아니라 '두 신호의 가속도 벡터 차이'라는 점이 핵심이다.
+    참조가 바뀌면서 평활도 prior → 보존 prior 로 의미가 뒤집힌다.
+
+    왜 이 형태인가:
+      - Δ²는 상수·1차 성분을 소거한다 → 정당한 de-clip이 수행하는 '상수 재배치'(팔을 몸에서
+        일정 거리 띄우는 교정)에 불변. 올바른 교정을 의도 훼손으로 벌하지 않는다.
+      - 지속형(persistent) 주입은 그 자체가 상수 오프셋이라 가속도 ≈ 0 → 주입 관절이 자동
+        상쇄된다. 즉 이 시나리오에서는 bone_idx 마스크 없이 계산 가능하며, 라벨이 존재하지
+        않는 '실제 배포 스트림'에서도 그대로 계산할 수 있다 (intent_mae의 구조적 약점 우회).
+      - 크기 차(‖Δ²(out)‖−‖Δ²(in)‖)가 아니라 벡터 차인 이유: 크기만 보면 방향이 달라져도
+        0이 될 수 있다. 벡터 차여야 타이밍/위상 변화를 잡는다.
+
+    ⚠️ 한계 (단독 사용 금지): 정적 의미 오류에 맹목이다. 정지 제스처가 다른 정지 제스처로
+       뒤바뀌어도 양쪽 모두 Δ²=0이라 이 지표는 0을 보고한다. 반드시 정적 포즈/의미 항과
+       병용해야 한다 (짝이 될 cOKS는 Tier 2). 또한 transient 주입은 그 자체에 가속도 서명이
+       있으므로, 그 시나리오에서 이 값은 '글리치 제거분'과 '퍼포먼스 왜곡분'이 섞여 있다.
+    """
+    if gp_out.shape[0] < 3:
+        return 0.0
+    acc_out = gp_out[2:] - 2 * gp_out[1:-1] + gp_out[:-2]
+    acc_in = gp_in[2:] - 2 * gp_in[1:-1] + gp_in[:-2]
+    return torch.norm(acc_out - acc_in, dim=-1).mean().item() * 100.0
 
 
 def inject_arm_collision(motion, angle_deg=80.0, bone='LeftUpperArm'):
@@ -256,6 +332,7 @@ def _eval_one_scenario(scenario, model, physics_engine, ALL_PAIRS, test_files,
     # ---- 테스트셋 전체 순회하며 파일별 지표 수집 --------------------
     col_before, col_after = [], []
     mpjpe_list, mae_list, intent_list = [], [], []
+    intent_dyn_list = []            # [항목 3] 동역학 보존 (전 시나리오)
     jit_before, jit_after = [], []
     bonelen_after = []
     n_used = 0
@@ -272,6 +349,29 @@ def _eval_one_scenario(scenario, model, physics_engine, ALL_PAIRS, test_files,
     pair_max_before = torch.zeros(len(ALL_PAIRS))   # 페어별 최악 침투 (교정 전/후)
     pair_max_after = torch.zeros(len(ALL_PAIRS))
 
+    # [항목 4] 학습이 '실제로' 최적화하는 4쌍(MONITORED_PAIRS = train.COLLIDING_PAIRS) 한정 누적기.
+    #   역할 분리: 4쌍 = 학습 충실도(de-clip 성능) / 112쌍 = 전신 do-no-harm(부작용 감시).
+    #   지금까지 한 숫자가 두 역할을 겸해 생긴 해석 혼동을 지표 분리로 해소한다 (§8-A).
+    #   ⚠️ 기존 112쌍 지표는 그대로 병기한다 — 치환하면 과거 44행과 비교 가능성이 파괴된다.
+    n_coll4_before = 0
+    n_coll4_after = 0
+    depth4_sum_before = 0.0
+    depth4_sum_after = 0.0
+    max_pen4_before = 0.0
+    max_pen4_after = 0.0
+
+    # [항목 2] 3DPCK 누적기 — 파일별 평균의 평균이 아니라 '전역 카운터'로 센다
+    #   (clean_frames_pct와 동일한 이벤트 의미론 유지). pck_gate가 False면 계산 자체를 건너뛴다.
+    pck_gate = scenario in PCK_SCENARIOS
+
+    # [항목 1] 추론 시간 측정 (R4). 모델 forward '만' 잰다 — FK/충돌 계산은 평가 전용이라 제외.
+    #   앞 TIMING_WARMUP_FILES개는 CUDA 컨텍스트 초기화/커널 캐싱 때문에 통계에서 버린다.
+    win_ms = []
+    n_joint_total = 0                                    # 총 (프레임 × 관절) 수
+    pck_joint_hit = {t: 0 for t in PCK_THRESHOLDS_CM}    # 관절 단위 통과 수
+    pck_frame_hit = {t: 0 for t in PCK_THRESHOLDS_CM}    # 프레임 '전원 통과' 수 (R1의 이벤트 형태)
+    joint_err_sum = torch.zeros(len(BONE_NAMES))         # 관절별 오차 합 (콘솔 top-3 최악 관절용)
+
     with torch.no_grad():
         for i, fpath in enumerate(test_files):
             motion = torch.load(fpath)
@@ -283,7 +383,16 @@ def _eval_one_scenario(scenario, model, physics_engine, ALL_PAIRS, test_files,
             model_input, meta = make_scenario_input(scenario, clean, i, physics_engine)
             if meta is not None and meta.get('fallback'):
                 n_inject_fallback += 1
-            recon, _, _ = model(model_input.to(DEVICE).unsqueeze(0))  # [1, 30, 87]
+            # [항목 1] forward 구간만 계측. CUDA는 비동기이므로 synchronize로 커널 완료를 기다린다
+            #   (없으면 '큐에 넣는 시간'만 재게 되어 값이 비현실적으로 작아진다).
+            model_in_dev = model_input.to(DEVICE).unsqueeze(0)
+            if DEVICE == 'cuda':
+                torch.cuda.synchronize()
+            _t0 = time.perf_counter()
+            recon, _, _ = model(model_in_dev)                          # [1, 30, 87]
+            if DEVICE == 'cuda':
+                torch.cuda.synchronize()
+            win_ms.append((time.perf_counter() - _t0) * 1000.0)
             corr = recon.squeeze(0).cpu()                   # [30, 87] 모델 교정 결과
 
             # FK로 관절 월드 좌표 복원 [30, 21, 3]
@@ -313,9 +422,39 @@ def _eval_one_scenario(scenario, model, physics_engine, ALL_PAIRS, test_files,
             pair_max_before = torch.maximum(pair_max_before, dep_in.max(dim=0).values)
             pair_max_after = torch.maximum(pair_max_after, dep_c.max(dim=0).values)
 
+            # (1-c) [항목 4] 동일한 집계를 '학습 대상 4쌍'에만 적용 (헤드라인 de-clip 지표).
+            #   ⚠️ 4쌍은 112쌍의 부분집합이 아니다 (2026-07-28 실측 확인):
+            #      get_all_eval_pairs()는 캡슐을 (PARENTS[b], b)로만 만드는데 PARENTS['Chest']='Spine'
+            #      이므로, 손으로 정의한 긴 몸통 캡슐 (Hips→Chest)은 112쌍에 등장할 수 없다.
+            #      즉 4쌍 중 2쌍(몸통↔좌/우 하박)은 112쌍이 '구조적으로 볼 수 없는' 충돌이다.
+            #      → max_pen4 > max_pen(112) 이 정상적으로 발생할 수 있다. 부분집합 가정 금지.
+            dep4_in = physics_engine.get_penetration_depths(dict_in, MONITORED_PAIRS) * 100.0
+            dep4_c = physics_engine.get_penetration_depths(dict_c, MONITORED_PAIRS) * 100.0
+            f4max_in = dep4_in.max(dim=1).values   # [30] 프레임별 최대 침투 깊이 (4쌍 한정)
+            f4max_c = dep4_c.max(dim=1).values
+
+            n_coll4_before += int((f4max_in > 1e-4).sum())
+            n_coll4_after += int((f4max_c > 1e-4).sum())
+            depth4_sum_before += float(f4max_in.sum())
+            depth4_sum_after += float(f4max_c.sum())
+            max_pen4_before = max(max_pen4_before, float(f4max_in.max()))
+            max_pen4_after = max(max_pen4_after, float(f4max_c.max()))
+
             # (2) MPJPE(cm): 교정 결과 vs '깨끗한 정답'과의 위치 오차
             #     clean=원본 보존 오차 / transient=복원 오차 / persistent·legacy80=참고 수치
-            mpjpe_list.append((torch.norm(gp_clean - gp_corr, dim=-1) * 100.0).mean().item())
+            #     관절별 거리 [30, 21]을 변수로 빼서 아래 3DPCK가 그대로 재사용한다 (재계산 없음).
+            joint_dist_cm = torch.norm(gp_clean - gp_corr, dim=-1) * 100.0   # [30, 21] cm
+            mpjpe_list.append(joint_dist_cm.mean().item())
+
+            # (2-b) [항목 2] 3DPCK: 같은 거리 텐서에 임계값 비교만 추가 → 평균이 이벤트 비율이 된다.
+            #   MPJPE의 1/21 희석(한 관절 20cm 오차 ≈ 전신 1cm 오차) 문제를 분포 형태로 보완.
+            if pck_gate:
+                n_joint_total += joint_dist_cm.numel()
+                joint_err_sum += joint_dist_cm.sum(dim=0)
+                for t in PCK_THRESHOLDS_CM:
+                    ok = joint_dist_cm < t                      # [30, 21]
+                    pck_joint_hit[t] += int(ok.sum())           # 관절 단위
+                    pck_frame_hit[t] += int(ok.all(dim=1).sum())  # 프레임 전원 통과
 
             # (3) MAE(deg): 교정 결과 vs 깨끗한 정답의 회전 차이
             mae_list.append(calculate_mae(clean, corr))
@@ -323,6 +462,11 @@ def _eval_one_scenario(scenario, model, physics_engine, ALL_PAIRS, test_files,
             # (3-b) 의도 보존: 주입되지 않은 관절들의 (출력 vs 손상 입력) 회전 차이
             if meta is not None and meta.get('type') != 'clean':
                 intent_list.append(calculate_intent_mae(corr, model_input, meta['bone_idx']))
+
+            # (3-c) [항목 3] 동역학 보존: 출력과 손상 입력의 가속도 '벡터 차'
+            #   clean 시나리오에서는 gp_input == gp_clean 이므로 "모델이 멀쩡한 동역학을
+            #   얼마나 왜곡하는가"를 재는 do-no-harm 수치가 된다 → 전 시나리오 기록.
+            intent_dyn_list.append(calculate_intent_dyn(gp_corr, gp_input))
 
             # (4) Jitter(참고 지표): 부드러움
             jit_before.append(calculate_acceleration_jitter(gp_input))
@@ -352,6 +496,18 @@ def _eval_one_scenario(scenario, model, physics_engine, ALL_PAIRS, test_files,
     ja_m, _ = ms(jit_after)
     bl_m, _ = ms(bonelen_after)
     intent_m = float(np.mean(intent_list)) if intent_list else None
+    intent_dyn_m = float(np.mean(intent_dyn_list)) if intent_dyn_list else None
+
+    # [항목 1] 추론 시간 집계 — 워밍업 구간 제외 후 평균/p95.
+    #   p95를 함께 두는 이유: R4의 실패는 평균이 아니라 '스파이크'에서 발생한다
+    #   (한 프레임이라도 예산을 넘기면 드롭 → 시청자에게 보이는 결함).
+    timed = win_ms[TIMING_WARMUP_FILES:] if len(win_ms) > TIMING_WARMUP_FILES else win_ms
+    if timed:
+        infer_ms_mean = float(np.mean(timed))
+        infer_ms_p95 = float(np.percentile(timed, 95))
+        infer_ms_frame = infer_ms_mean / SEQ_LEN
+    else:
+        infer_ms_mean = infer_ms_p95 = infer_ms_frame = None
 
     # 선형 침투 지표 집계
     clean_before_pct = 100.0 * (1.0 - n_coll_frames_before / max(n_frames_total, 1))
@@ -360,6 +516,21 @@ def _eval_one_scenario(scenario, model, physics_engine, ALL_PAIRS, test_files,
     mean_pen_after = depth_sum_after / max(n_coll_frames_after, 1)
     depth_removal_pct = (100.0 * (1.0 - depth_sum_after / depth_sum_before)
                          if depth_sum_before > 0 else None)
+
+    # [항목 4] 4쌍 한정 집계 (112쌍과 완전히 같은 공식 — 페어 범위만 다르다)
+    clean4_before_pct = 100.0 * (1.0 - n_coll4_before / max(n_frames_total, 1))
+    clean4_after_pct = 100.0 * (1.0 - n_coll4_after / max(n_frames_total, 1))
+    depth_removal4_pct = (100.0 * (1.0 - depth4_sum_after / depth4_sum_before)
+                          if depth4_sum_before > 0 else None)
+
+    # [항목 2] 3DPCK 집계 (게이팅된 시나리오에서만 값이 생기고, 그 외에는 None → CSV 빈칸)
+    if pck_gate and n_joint_total > 0:
+        n_frames_pck = n_joint_total // len(BONE_NAMES)
+        pck_joint = {t: 100.0 * pck_joint_hit[t] / n_joint_total for t in PCK_THRESHOLDS_CM}
+        pck_frame = {t: 100.0 * pck_frame_hit[t] / n_frames_pck for t in PCK_THRESHOLDS_CM}
+        joint_err_mean = joint_err_sum / max(n_frames_pck, 1)   # 관절별 평균 오차(cm)
+    else:
+        pck_joint, pck_frame, joint_err_mean = None, None, None
 
     # ---- 결과 출력 --------------------------------------------------
     scenario_desc = {
@@ -381,16 +552,19 @@ def _eval_one_scenario(scenario, model, physics_engine, ALL_PAIRS, test_files,
     if scenario == "persistent" and n_inject_fallback:
         print(f"  [주의] 깊이 목표 실패로 클린 폴백된 파일: {n_inject_fallback}개")
 
-    print("\n[1] 전신 물리적 무결성 (Physical Plausibility) — 평균")
-    print(f"  ▶ 총 {len(ALL_PAIRS)}개 전신 관절 페어")
-    print(f"     - Before 충돌(평균, {'손상 입력' if corrupt else 'clean 입력'}) : {cb_m:.6f}")
-    print(f"     - After  충돌(평균, 모델 출력) : {ca_m:.6f}")
-    if corrupt and cb_m > 0:
-        print(f"     - 충돌 제거율(구형 제곱 지표, 과대 평가 경향) : {(1 - ca_m / cb_m) * 100:.1f}%")
-    print(f"  ▶ 뼈 길이 변동성(평균) : {bl_m:.4f} cm  (고정 오프셋 → 0 수렴)")
+    # ── [1] 헤드라인 = 학습 대상 4쌍 (§8-A). de-clip '성능'은 이 블록으로 판단한다. ──
+    print(f"\n[1] de-clip 성능 (헤드라인) — 학습 대상 {len(MONITORED_PAIRS)}개 페어, 선형 깊이(cm)")
+    print("    ↳ 역할: 학습 충실도. 물리 손실이 실제로 최적화한 바로 그 페어 집합.")
+    print(f"  ▶ 충돌 없는 프레임 비율 : Before {clean4_before_pct:.1f}% → After {clean4_after_pct:.1f}%  (R1: 100%가 목표)")
+    print(f"  ▶ 최대 침투 깊이(최악)  : Before {max_pen4_before:.2f} cm → After {max_pen4_after:.2f} cm")
+    if depth_removal4_pct is not None:
+        print(f"  ▶ 깊이 기준 충돌 제거율 : {depth_removal4_pct:.1f}%  (선형)")
 
-    print("\n[1-b] 해석 가능한 충돌 지표 — 선형 깊이(물리 단위), 테스트셋 전체")
-    print(f"  ▶ 충돌 없는 프레임 비율 : Before {clean_before_pct:.1f}% → After {clean_after_pct:.1f}%  (R1: 100%가 목표)")
+    # ── [1-b] 전신 112쌍 = do-no-harm 감시 (디버그). 강등되었을 뿐 값은 불변. ──
+    print(f"\n[1-b] 전신 do-no-harm (디버그) — 자동 생성 {len(ALL_PAIRS)}개 페어, 선형 깊이(cm)")
+    print("    ↳ 역할: 부작용 감시. 학습이 보지 않는 페어까지 포함하므로 de-clip 성능 지표가 아니다.")
+    print(f"       (4쌍은 112쌍의 부분집합이 아님 — 몸통 캡슐 Hips→Chest는 112쌍에 존재하지 않는다)")
+    print(f"  ▶ 충돌 없는 프레임 비율 : Before {clean_before_pct:.1f}% → After {clean_after_pct:.1f}%")
     print(f"  ▶ 최대 침투 깊이(최악)  : Before {max_pen_before:.2f} cm → After {max_pen_after:.2f} cm")
     print(f"  ▶ 충돌 프레임 평균 깊이 : Before {mean_pen_before:.2f} cm → After {mean_pen_after:.2f} cm")
     if depth_removal_pct is not None:
@@ -403,14 +577,61 @@ def _eval_one_scenario(scenario, model, physics_engine, ALL_PAIRS, test_files,
             break
         (p1, c1), (p2, c2) = ALL_PAIRS[idx]
         print(f"     - 교정 후 최악 페어: ({p1}→{c1}) ↔ ({p2}→{c2})  최대 {depth:.2f} cm")
+    print(f"  ▶ 구형 제곱 충돌 지표(과대 평가 경향, 시대 간 연속성용) : "
+          f"Before {cb_m:.6f} → After {ca_m:.6f}")
+    if corrupt and cb_m > 0:
+        print(f"     - 구형 제거율 : {(1 - ca_m / cb_m) * 100:.1f}%")
+    print(f"  ▶ 뼈 길이 변동성(평균) : {bl_m:.4f} cm  (고정 오프셋 → 0 수렴)")
 
+    # ── [2] 클린 기준 충실도. 지속형에서는 이 블록이 헤드라인이 아니다(아래 [3]으로 강등). ──
+    clean_ref_valid = scenario in PCK_SCENARIOS
     print("\n" + "-" * 60)
-    print("[2] 모션 품질 및 유사도 (Motion Quality) — 평균 ± 표준편차")
-    print(f"  ▶ MPJPE({mpjpe_label}) : {mp_m:.2f} ± {mp_s:.2f} cm")
-    print(f"  ▶ 회전 각도 오차 (MAE)     : {ma_m:.2f} ± {ma_s:.2f} 도")
+    if clean_ref_valid:
+        print("[2] 모션 품질 및 유사도 (Motion Quality) — 평균 ± 표준편차")
+        print(f"  ▶ MPJPE({mpjpe_label}) : {mp_m:.2f} ± {mp_s:.2f} cm")
+        print(f"  ▶ 회전 각도 오차 (MAE)     : {ma_m:.2f} ± {ma_s:.2f} 도")
+        pj = " / ".join(f"{t:g}cm {pck_joint[t]:.1f}%" for t in PCK_THRESHOLDS_CM)
+        pf = " / ".join(f"{t:g}cm {pck_frame[t]:.1f}%" for t in PCK_THRESHOLDS_CM)
+        print(f"  ▶ 3DPCK (관절 단위)        : {pj}")
+        print(f"  ▶ 3DPCK (프레임 전원 통과) : {pf}   ← R1의 이벤트 형태")
+        k3 = min(3, len(BONE_NAMES))
+        worst = torch.topk(joint_err_mean, k=k3)
+        detail = ", ".join(f"{BONE_NAMES[i]} {v:.2f}cm"
+                           for v, i in zip(worst.values.tolist(), worst.indices.tolist()))
+        print(f"     - 최악 관절 top-{k3}: {detail}  (FK 사슬 누적 → 말단이 지배적)")
+    else:
+        # persistent/legacy80: 클린 기준 지표는 '복원할수록 점수가 오르는' 역상관이므로
+        # 헤드라인에서 내리고 참고 수치로만 남긴다. CSV 값은 히스토리 보존을 위해 그대로 기록.
+        print("[2] 클린 기준 지표 — ⚠️ 참고 수치 (헤드라인 아님)")
+        print("    ↳ 지속형 손상에서 '클린 복원'은 제품 목표가 아니다(목표=최소 사영). 이 값이")
+        print("      낮을수록 좋다고 해석하면 의도된 포즈를 되돌리는 모델을 우대하게 된다.")
+        print(f"  ▶ MPJPE({mpjpe_label}) : {mp_m:.2f} ± {mp_s:.2f} cm")
+        print(f"  ▶ 회전 각도 오차 (MAE)     : {ma_m:.2f} ± {ma_s:.2f} 도")
+        print("  ▶ 3DPCK                    : 미측정(의도적) — 위와 같은 역상관 사유")
+
+    # ── [3] 의도/퍼포먼스 보존 (R2). 지속형에서는 [1]과 함께 이 블록이 헤드라인이다. ──
+    print("\n[3] 의도·퍼포먼스 보존 (R2)" + ("" if clean_ref_valid else "  ← 지속형의 헤드라인"))
     if intent_m is not None:
-        print(f"  ▶ 의도 보존 (비주입 관절, 출력 vs 손상 입력) : {intent_m:.2f} 도  (낮을수록 좋음, R2)")
+        print(f"  ▶ 부수 변화(collateral, 비주입 관절: 출력 vs 손상 입력) : {intent_m:.2f} 도  (낮을수록 좋음)")
+        print("    ↳ 주의: '의도'가 아니라 '주입되지 않은 관절이 얼마나 덩달아 움직였는가'다.")
+        print("       배포 시에는 주입 라벨이 없어 계산 불가 (CSV 컬럼명은 히스토리 보존상 intent_mae_deg 유지).")
+    if intent_dyn_m is not None:
+        role = "do-no-harm(동역학 왜곡)" if scenario == "clean" else "동역학 보존"
+        print(f"  ▶ 동역학 보존 intent_dyn : {intent_dyn_m:.4f} cm/frame²  ({role}, 낮을수록 좋음)")
+        print("    ↳ ‖Δ²(출력) − Δ²(입력)‖ — 상수 재배치에 불변이라 정당한 교정을 벌하지 않는다.")
+        print("       persistent에서는 마스크 없이 계산되어 '배포 스트림에서도 측정 가능'하다.")
+        print("       ⚠️ 정적 의미 오류에 맹목 → 단독 판단 금지, 포즈/의미 항(cOKS, Tier 2)과 병용할 것.")
     print(f"  ▶ Jitter(참고 지표)        : Before {jb_m:.4f} / After {ja_m:.4f} cm/frame²")
+
+    # ── [4] 추론 속도 (R4). 지금까지 한 번도 측정되지 않던 요구사항. ──
+    if infer_ms_mean is not None:
+        print(f"\n[4] 추론 속도 (R4) — device={DEVICE}, 워밍업 {TIMING_WARMUP_FILES}개 제외 "
+              f"(n={len(timed)})")
+        print(f"  ▶ 30프레임 윈도우 1회 : 평균 {infer_ms_mean:.2f} ms / p95 {infer_ms_p95:.2f} ms")
+        print(f"  ▶ 프레임당 환산       : {infer_ms_frame:.3f} ms/frame")
+        print("    ↳ ⚠️ 이 값은 '배포 지연시간'이 아니라 상한 프록시(하한 비용)다. 아직 causal 모드,")
+        print("       출력 스무딩 필터, 60↔30fps 리샘플 어댑터가 구현되지 않았고, 30프레임 윈도우를")
+        print("       한 번에 처리하는 구조라 실서비스에는 ~1초의 look-ahead 지연이 별도로 존재한다.")
     print("=" * 60)
 
     # ---- 실험 기록: 시나리오별 집계 지표를 CSV 한 줄로 저장 ----------
@@ -439,6 +660,27 @@ def _eval_one_scenario(scenario, model, physics_engine, ALL_PAIRS, test_files,
         "jitter_before_mean": round(jb_m, 4),
         "jitter_after_mean": round(ja_m, 4),
         "bonelen_after_cm_mean": round(bl_m, 4),
+        # ---- Tier 1 신규 컬럼 (순서 고정: 반드시 기존 24개 뒤에만) --------------
+        # [항목 4] 학습 대상 4쌍 한정 헤드라인 지표 (112쌍 컬럼은 위에 그대로 병기)
+        "max_pen4_before_cm": round(max_pen4_before, 2),
+        "max_pen4_after_cm": round(max_pen4_after, 2),
+        "clean_frames4_before_pct": round(clean4_before_pct, 2),
+        "clean_frames4_after_pct": round(clean4_after_pct, 2),
+        "depth_removal4_pct": round(depth_removal4_pct, 1) if depth_removal4_pct is not None else "",
+        # [항목 2] 3DPCK — 게이팅되지 않은 시나리오(persistent/legacy80)는 의도적으로 빈칸
+        "pck_1cm": round(pck_joint[1.0], 2) if pck_joint else "",
+        "pck_2cm": round(pck_joint[2.0], 2) if pck_joint else "",
+        "pck_5cm": round(pck_joint[5.0], 2) if pck_joint else "",
+        "pck_frame_1cm": round(pck_frame[1.0], 2) if pck_frame else "",
+        "pck_frame_2cm": round(pck_frame[2.0], 2) if pck_frame else "",
+        "pck_frame_5cm": round(pck_frame[5.0], 2) if pck_frame else "",
+        # [항목 3] 동역학 보존 (전 시나리오)
+        "intent_dyn_cm": round(intent_dyn_m, 4) if intent_dyn_m is not None else "",
+        # [항목 1] 추론 시간 (R4). ⚠️ 상한 프록시 — causal/필터/리샘플 미포함, look-ahead 별도.
+        "infer_ms_window_mean": round(infer_ms_mean, 3) if infer_ms_mean is not None else "",
+        "infer_ms_window_p95": round(infer_ms_p95, 3) if infer_ms_p95 is not None else "",
+        "infer_ms_per_frame": round(infer_ms_frame, 4) if infer_ms_frame is not None else "",
+        "infer_device": DEVICE,
     }
     csv_path = append_results_csv(row)
     print(f"📝 시나리오 '{scenario}' 집계 지표가 '{csv_path}'에 기록되었습니다 "

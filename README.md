@@ -63,7 +63,7 @@ Sample_Data: Bandai_Dataset_csv_modi_tot 사용
             + collision -> transient : persistent = 3: 7
     + 평가 과정에 clean / transient / persistent + legacy80
         * legacy80: leftupperarm이 80도 안으로 (학습 과정에 없었던 collision)
-    + Model: PVT+VAE -> TFM
+    + Model: PVT+VAE -> TFM (PVE+VAE Model은 local에 저장)
         * TFM이 PVT+VAE에 비해 평균적인 성능이 더 좋았음
         * 현재 가장 Best Model: TFM 1/0.4
     + 학습 / 평가 시드 동일
