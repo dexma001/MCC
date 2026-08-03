@@ -1,4 +1,4 @@
-# PVTVAE(for Motion_Correction)
+# Motion Capture Correction
 
 2026 Capsone Project
 
@@ -7,7 +7,8 @@
 #### AI_model: main folder  
 - dataset_pipeline: Sample_Data(.csv) 파일을 .pt로 변환  
 - physics_module: Define Loss Function (with Lumelsky's Algorithm)
-- model: VAE model
+- models: TransformerDenoiser (기본 아키텍처, 결정론적 — VAE 아님)
+    + 원본 PVTVAE(VAE 포함)는 PVTVAE_baseline/ 으로 분리 보존됨
 - train: Training Function
 - inference:  
     + Input_0: 가지고 있는 Sample Data(maybe Clean)
@@ -25,12 +26,12 @@
 - 3D_Collision_tot: Collision 발생 시각화
 - test_physics: Testing physics_module
 
+#### PVTVAE_baseline: 원본 PVTVAE(VAE) 재현용 위성 폴더
+- 데이터 계약/물리/손상 주입/평가 스위트는 AI_model/ 을 그대로 import해 재사용하고,
+  아키텍처(model.py)만 다르다. run 폴더 태그로 구분되어 결과가 서로 덮어쓰지 않는다.
+
 ## *Under this line, there is no classification folder*
 
-watch_*_in_python: Sample_Data를 Matplot을 사용하여 확인  
-
-Miscellaneous: Memo text
-  
 .gitignore
   
 README
