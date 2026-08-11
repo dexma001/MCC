@@ -14,6 +14,9 @@ collision_after_root_cause_report.md §7 (2026-07-07 합의).
     각도가 아닌 '관통 깊이'를 기준으로 목표 1~4cm를 탐색한다 — 같은 각도라도 포즈에 따라
     충돌량이 달라(실증됨) 각도 고정으로는 손상 강도가 통제되지 않기 때문. 각도는 통제
     변수가 아니므로 사다리(ladder) + 이분 보간으로 깊이 범위에 들어가는 각도를 찾는다.
+    ⚠️ 깊이 판정은 '주입 구간의 (coverage, 중앙값)'으로 한다 — 윈도우 전체 max 하나로
+    판정하면 한 프레임만 깊게 뚫린 후보가 채택되어 나머지가 무관통으로 남는다
+    (2026-08-07 수정 전 실측: 주입 구간 프레임의 62%가 침투 0 → 수정 후 0.0%).
     구간은 전-윈도우(다수) + 반열림(onset/offset, 소수) 혼합 — 완전 포함 구간은
     윈도우 스케일에서 일시적 시그니처가 되므로 사용하지 않는다 (보고서 §7-B-2).
 
@@ -48,6 +51,8 @@ def make_cfg(clean_ratio=0.5,
              persistent_halfopen_ratio=0.35,
              halfopen_min_len=15,
              persistent_max_rounds=6,
+             persistent_min_coverage=1.0,
+             persistent_draws_per_round=6,
              inject_bones=None):
     """
     손상 주입 설정 dict 생성 (JSON 직렬화 가능 → run_config.json에 그대로 기록).
@@ -61,6 +66,16 @@ def make_cfg(clean_ratio=0.5,
                                     나머지는 전-윈도우(무문맥 최소사영 학습의 핵심 샘플).
       - halfopen_min_len   : 반열림 구간의 최소 길이(프레임). 윈도우 절반 이상을 관통 상태로
                              유지해 '윈도우 안에서 손상이 완결되지 않음'이라는 지속형 본질을 보존.
+      - persistent_min_coverage : 지속 주입 구간에서 '실제로 관통한 프레임' 최소 비율.
+                             1.0이면 구간 전 프레임이 관통해야 채택. 구판에는 이 조건이
+                             없어(윈도우 max만 검사) 구간 프레임의 62%가 무관통이었다
+                             (실측 2026-08-07). 지속형의 정의가 '구간 내내 관통'이므로
+                             이것이 유형을 유형답게 만드는 핵심 파라미터다.
+      - persistent_draws_per_round : 라운드당 추첨하는 (본, 축) 조합 수. coverage 조건이
+                             붙으면 임의의 본/축으로는 구간 내내 관통시키기 어려워
+                             1개만 뽑으면 클린 폴백이 급증한다(실측 38~49%). FK는
+                             라운드당 1회 배치이므로 이 값을 올려도 FK 호출 수는 늘지
+                             않는다(후보 텐서만 커진다). 6에서 폴백률이 구판 수준으로 복귀.
     """
     return dict(
         clean_ratio=clean_ratio,
@@ -74,6 +89,8 @@ def make_cfg(clean_ratio=0.5,
         persistent_halfopen_ratio=persistent_halfopen_ratio,
         halfopen_min_len=halfopen_min_len,
         persistent_max_rounds=persistent_max_rounds,
+        persistent_min_coverage=persistent_min_coverage,
+        persistent_draws_per_round=persistent_draws_per_round,
         inject_bones=list(inject_bones or DEFAULT_INJECT_BONES),
     )
 
@@ -149,16 +166,41 @@ def _apply_local_delta_multi(window, bone_idx, frames, axis_angles_list):
     return out
 
 
-def _depths_batched(windows, physics, pairs):
+def _frame_depths_batched(windows, physics, pairs):
     """
-    후보 윈도우 묶음 [M, S, 87]의 윈도우별 최대 선형 관통 깊이(cm) [M] 반환.
+    후보 윈도우 묶음 [M, S, 87]의 '프레임별' 최대 선형 관통 깊이(cm) [M, S] 반환.
     라운드당 FK 1회로 모든 후보를 평가하는 것이 이 모듈의 속도 핵심.
-    (주입되지 않은 프레임은 클린 ≈ 무관통이므로 전 프레임 max ≈ 주입 구간 max.)
     """
     with torch.no_grad():
         dep = physics.get_penetration_depths_from_quats(
             windows[..., :3], windows[..., 3:], pairs) * 100.0    # [M, S, n_pairs]
-    return dep.amax(dim=(-1, -2))                                 # [M]
+    return dep.amax(dim=-1)                                       # [M, S]
+
+
+def _depths_batched(windows, physics, pairs):
+    """
+    후보 윈도우 묶음 [M, S, 87]의 윈도우별 최대 선형 관통 깊이(cm) [M] 반환.
+    (주입되지 않은 프레임은 클린 ≈ 무관통이므로 전 프레임 max ≈ 주입 구간 max.)
+
+    ⚠️ 이 '윈도우 하나당 스칼라 하나' 요약은 transient(sin-ramp: 애초에 한 봉우리만
+    깊게 뚫는 것이 정의)에만 적합하다. persistent는 구간 '내내' 관통해야 하므로
+    max 하나로는 품질을 판정할 수 없다 — _seg_stats를 쓴다. (2026-08-07)
+    """
+    return _frame_depths_batched(windows, physics, pairs).amax(dim=-1)   # [M]
+
+
+def _seg_stats(frame_depths, f0, f1):
+    """
+    프레임별 깊이 [S] 에서 주입 구간 [f0, f1] 의 (coverage, 중앙값, 최대값)을 낸다.
+      - coverage : 구간 프레임 중 실제로 관통(>0)한 비율. '지속성'의 척도.
+      - 중앙값   : 전형적인 프레임의 침투 깊이. 목표 범위(1~4cm) 판정에 쓴다.
+    윈도우 max 대신 이 둘을 보는 이유: 같은 각도라도 포즈가 프레임마다 달라 깊이가
+    출렁이므로, max만 보면 '한 프레임만 3cm 뚫린' 후보가 채택되어 나머지 프레임이
+    무관통으로 남는다 (실측 2026-08-07: 주입 구간 프레임의 62%가 침투 0이었다).
+    """
+    seg = frame_depths[f0:f1 + 1]
+    cov = float((seg > 1e-4).float().mean())
+    return cov, float(seg.median()), float(seg.max())
 
 
 # ------------------------------------------------------------------
@@ -245,6 +287,7 @@ def _inject_persistent_group(windows, physics, cfg, rng, pairs):
     n = len(windows)
     S = windows[0].shape[0]
     lo, hi = cfg['persistent_depth_range_cm']
+    min_cov = cfg.get('persistent_min_coverage', 0.9)
     ladder = list(cfg['persistent_angle_ladder_deg'])
     results = [None] * n
 
@@ -272,52 +315,65 @@ def _inject_persistent_group(windows, physics, cfg, rng, pairs):
             f0, f1, seg = seg_info[j]
             frames = list(range(f0, f1 + 1))
             if p['refine'] is not None:
-                bone, axis, angle_list = p['refine']
-                axes = (axis,)
+                draws = [p['refine']]                      # (bone, [축], 각도열)
             else:
-                bone = rng.choice(cfg['inject_bones'])
-                axis = _rand_unit_axis(rng)
-                angle_list = ladder
-                axes = (axis, [-a for a in axis])
+                # 라운드마다 (본, 축)을 여러 개 뽑는다. coverage 조건을 붙인 뒤로는
+                # '아무 본/축'이나 구간 내내 관통시키지 못하기 때문 — 1개만 뽑으면
+                # 대부분 실패해 클린 폴백으로 떨어진다 (실측: 폴백 45%).
+                # FK는 어차피 라운드당 1회 배치이므로 후보를 늘려도 호출 수는 그대로다.
+                draws = []
+                for _ in range(cfg.get('persistent_draws_per_round', 3)):
+                    ax0 = _rand_unit_axis(rng)
+                    draws.append((rng.choice(cfg['inject_bones']),
+                                  [ax0, [-a for a in ax0]], ladder))
                 p['draws'] += 1
-            p['last_draw'] = (bone,)
-            combos = [(ax, theta) for ax in axes for theta in angle_list]
-            multi = _apply_local_delta_multi(
-                windows[j], BONE_MAP[bone], frames,
-                [(ax, [math.radians(theta)] * len(frames)) for ax, theta in combos])
-            for k, (ax, theta) in enumerate(combos):
-                cands.append(multi[k])
-                owners.append(id(p))
-                cmetas.append(dict(bone=bone, axis=ax, theta=theta, frames=(f0, f1), seg=seg))
+            for bone, axes, angle_list in draws:
+                axes = [axes] if isinstance(axes[0], float) else list(axes)
+                combos = [(ax, theta) for ax in axes for theta in angle_list]
+                multi = _apply_local_delta_multi(
+                    windows[j], BONE_MAP[bone], frames,
+                    [(ax, [math.radians(theta)] * len(frames)) for ax, theta in combos])
+                for k, (ax, theta) in enumerate(combos):
+                    cands.append(multi[k])
+                    owners.append(id(p))
+                    cmetas.append(dict(bone=bone, axis=ax, theta=theta,
+                                       frames=(f0, f1), seg=seg))
 
-        depths = _depths_batched(torch.stack(cands), physics, pairs)
+        frame_depths = _frame_depths_batched(torch.stack(cands), physics, pairs)  # [M, S]
 
-        # 샘플별 후보 결과 취합
+        # 샘플별 후보 결과 취합. 깊이 판정은 '윈도우 max'가 아니라 주입 구간의
+        # (coverage, 중앙값)으로 한다 — 지속형의 정의가 '구간 내내 관통'이기 때문.
         by_p = {id(p): [] for p in pending}
         for c_i in range(len(cands)):
-            by_p[owners[c_i]].append((c_i, cmetas[c_i], float(depths[c_i])))
+            m = cmetas[c_i]
+            f0, f1 = m['frames']
+            cov, med, mx = _seg_stats(frame_depths[c_i], f0, f1)
+            by_p[owners[c_i]].append((c_i, m, cov, med, mx))
 
         still = []
         for p in pending:
             j = p['j']
             entries = by_p[id(p)]
-            # 1) 목표 범위 안의 후보가 있으면 그중 중앙값에 가장 가까운 것을 채택
-            in_range = [(c_i, m, d) for (c_i, m, d) in entries if lo <= d <= hi]
-            if in_range:
+            # 1) coverage를 만족하면서 깊이 중앙값이 목표 범위인 후보 → 중앙에 가장 가까운 것
+            ok = [e for e in entries if e[2] >= min_cov and lo <= e[3] <= hi]
+            if ok:
                 mid = (lo + hi) * 0.5
-                c_i, m, d = min(in_range, key=lambda e: abs(e[2] - mid))
+                c_i, m, cov, med, mx = min(ok, key=lambda e: abs(e[3] - mid))
                 results[j] = (cands[c_i], dict(type='persistent', bone=m['bone'],
                                                bone_idx=BONE_MAP[m['bone']],
                                                frames=m['frames'], seg=m['seg'],
                                                theta_deg=round(m['theta'], 2),
                                                axis=[round(a, 4) for a in m['axis']],
-                                               max_depth_cm=round(d, 3),
+                                               max_depth_cm=round(mx, 3),
+                                               median_depth_cm=round(med, 3),
+                                               coverage=round(cov, 3),
                                                tries=round_i, collided=True))
                 continue
-            # 2) 같은 축에서 범위를 감싸는 (얕음, 과침투) 쌍이 있으면 그 사이를 보간해 재시도
+            # 2) 같은 축에서 목표 범위를 감싸는 (얕음, 과침투) 쌍이 있으면 그 사이를 보간해 재시도.
+            #    보간의 조종 대상도 중앙값 — max로 조종하면 1)의 채택 조건과 어긋난다.
             refine = None
-            for ax_key in set(tuple(m['axis']) for (_c, m, _d) in entries):
-                ax_entries = sorted([(m['theta'], d) for (_c, m, d) in entries
+            for ax_key in set(tuple(m['axis']) for (_c, m, _v, _md, _mx) in entries):
+                ax_entries = sorted([(m['theta'], md) for (_c, m, _v, md, _mx) in entries
                                      if tuple(m['axis']) == ax_key])
                 below = [(t, d) for t, d in ax_entries if d < lo]
                 above = [(t, d) for t, d in ax_entries if d > hi]
@@ -334,12 +390,40 @@ def _inject_persistent_group(windows, physics, cfg, rng, pairs):
             # 3) 모든 각도·양방향이 무침투/얕음 → 이 본/축으로는 불가, 재추첨
             p['refine'] = None
             still.append(p)
+            # 차선책 보관: coverage를 만족하는 후보 중 목표 범위에 가장 가까운 것.
+            #   라운드를 모두 소진했을 때 '클린 폴백'으로 버리는 대신 이것을 쓴다.
+            #   (구판은 폴백 시 손상 샘플이 통째로 클린이 되어 지속형 비율이 조용히 줄었다)
+            cov_ok = [e for e in entries if e[2] >= min_cov and e[3] > 0.0]
+            if cov_ok:
+                mid = (lo + hi) * 0.5
+                cand = min(cov_ok, key=lambda e: abs(e[3] - mid))
+                prev = p.get('best')
+                if prev is None or abs(cand[3] - mid) < abs(prev[3] - mid):
+                    p['best'] = cand
+                    p['best_round'] = round_i
+                    # cands는 라운드마다 새로 만들어지므로 텐서를 지금 붙잡아 둔다
+                    # (인덱스만 저장하면 다음 라운드에 다른 후보를 가리키게 된다).
+                    p['best_window'] = cands[cand[0]]
         pending = still
 
-    for p in pending:   # 라운드 소진 → 클린 폴백 (이 샘플은 항등 보존 샘플로 학습됨)
+    for p in pending:   # 라운드 소진
         j = p['j']
         f0, f1, seg = seg_info[j]
-        results[j] = (windows[j].clone(), dict(type='clean', fallback=True, seg=seg))
+        best = p.get('best')
+        if best is not None:
+            # 목표 범위(1~4cm)에는 못 들었지만 coverage는 만족하는 차선 후보를 쓴다.
+            # 지속형의 본질(구간 내내 관통)은 지켜지므로 클린으로 버리는 것보다 정직하다.
+            c_i, m, cov, med, mx = best
+            results[j] = (p['best_window'], dict(
+                type='persistent', bone=m['bone'], bone_idx=BONE_MAP[m['bone']],
+                frames=m['frames'], seg=m['seg'], theta_deg=round(m['theta'], 2),
+                axis=[round(a, 4) for a in m['axis']],
+                max_depth_cm=round(mx, 3), median_depth_cm=round(med, 3),
+                coverage=round(cov, 3), tries=p.get('best_round', round_i),
+                collided=True, out_of_range=True))
+        else:
+            # coverage를 만족하는 후보가 아예 없었다 → 클린 폴백 (항등 보존 샘플로 학습)
+            results[j] = (windows[j].clone(), dict(type='clean', fallback=True, seg=seg))
     return results
 
 

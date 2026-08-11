@@ -21,8 +21,9 @@ LEARNING_RATE = 1e-4
 
 # =====================================================================
 # [실험용 조절 손잡이] recon vs phys 가중치
-#   - 실험마다 이 두 값을 바꿔가며 학습 -> inference.py -> evaluate.py 순서로 실행하면
+#   - 실험마다 이 두 값을 바꿔가며 train.py -> evaluate.py 순서로 실행하면
 #     evaluate.py가 지표를 evaluate_results.csv에 자동 기록합니다.
+#     (inference.py는 CSV에 기록하지 않는 단발 시각화용이라 이 경로에 필요하지 않다.)
 #   - 교정 강도는 절대값이 아니라 상대 비율(LAMBDA_PHYS / LAMBDA_RECON)이 결정하므로
 #     LAMBDA_RECON은 1.0으로 고정(anchor)하고 LAMBDA_PHYS만 스윕하는 것이 표준 방식입니다.
 #
@@ -48,7 +49,7 @@ BETA_KL      = 0.0   # ⚠️ 손실 아님 — run 폴더 이름/평가 코드 
 #   비율은 유형별 평가 행(evaluate.py 시나리오)으로 검증 후 조정한다 — 하드코딩 금지.
 # =====================================================================
 DECLIP_MODE = True                            # False = 구(舊) 클린→클린 정규화 학습 (비교/재현용)
-RUN_TAG = "tfm_declip" if DECLIP_MODE else "tfm"   # 'tfm' 접두어 → PVTVAE run 폴더와 절대 충돌 안 함
+RUN_TAG = "tfm_declip_cov_MSEOnly" if DECLIP_MODE else "tfm"   # 'tfm' 접두어 → PVTVAE run 폴더와 절대 충돌 안 함
 CORRUPTION_SEED = 777                         # 주입 파라미터 난수 시드 (run_config에 기록)
 CORRUPTION_CFG = corruption.make_cfg(
     clean_ratio=0.5,        # 항등 보존 앵커 (모델이 클린 입력에 충돌을 '새로 만들던' 문제 방지)
@@ -112,9 +113,11 @@ def train():
     start_epoch = 1
 
     # 재개는 '같은 가중치' 폴더 안에서만 한다 (다른 lambda는 자기 폴더에서 새로 시작).
-    # ⚠️ 체크포인트 파일명은 RUN_TAG_epoch_*.pth 를 유지한다 — 공유 헬퍼
-    #    (find_latest_checkpoint_in / find_run_dir_by_config / list_available_runs)의
-    #    글롭 패턴과 맞추기 위한 것으로, 아키텍처 구분은 '폴더명의 tfm_ 태그'가 담당한다.
+    # ⚠️ 체크포인트 파일명은 반드시 'pvtvae_epoch_*.pth' 를 유지한다 — 공유 헬퍼
+    #    (find_latest_checkpoint_in / find_run_dir_by_config / list_available_runs)가
+    #    이 패턴으로 글롭하므로, 다른 이름으로 저장하면 evaluate/inference/demo_maker가
+    #    가중치를 찾지 못하고 재개 파싱(split('_')[2])도 깨진다.
+    #    아키텍처 구분은 파일명이 아니라 '폴더명의 tfm_ 태그'가 담당한다.
     latest_ckpt = find_latest_checkpoint_in(run_dir)
     if latest_ckpt:
         try:
@@ -153,7 +156,7 @@ def train():
 
     # §4.1 손상 주입용 난수원 (파라미터 추첨 전용 — 텐서 연산 시드와 독립)
     corrupt_rng = random.Random(CORRUPTION_SEED)
-
+    
     # 재개 시 LR 스케줄을 이미 지난 에폭 수만큼 전진시켜 일관성 유지
     for _ in range(start_epoch - 1):
         scheduler.step()
@@ -209,14 +212,9 @@ def train():
             target_quats = clean_batch[..., 3:]    # [B, 30, 84] 클린 정답
             recon_quats  = recon_motion[..., 3:]   # [B, 30, 84]
 
-            # 🚨 1. 복구(De-clip) Loss — 손상 입력을 '클린 정답'으로 되돌리도록 직접 지도
             loss_recon_quat = nn.MSELoss()(recon_quats, target_quats)
 
-            # 🚨 2. L1 항 — 앵커는 클린 '타겟' (손상 '입력' 앵커는 일시적 복구를 방해하므로
-            #    사용하지 않음; 클린 샘플에서는 delta→0 희소성으로 작동)
-            loss_sparsity = nn.L1Loss()(recon_quats, target_quats) * 0.05
-
-            loss_recon = loss_recon_quat + loss_sparsity
+            loss_recon = loss_recon_quat 
 
             # 물리 엔진 연동: FK로 관절 월드 좌표 복원 → 충돌 Loss
             loss_phys = torch.tensor(0.0, device=DEVICE)
@@ -256,8 +254,8 @@ def train():
 
         # 모델 체크포인트 저장 (10 에폭마다) — 파일명 규칙은 상단 재개 로직의 주석 참조
         if epoch % 10 == 0:
-            torch.save(model.state_dict(), os.path.join(run_dir, f"{RUN_TAG}_epoch_{epoch}.pth"))
-            ckpt_msg = f"💾 Checkpoint saved: {run_name}/{RUN_TAG}_epoch_{epoch}.pth"
+            torch.save(model.state_dict(), os.path.join(run_dir, f"pvtvae_epoch_{epoch}.pth"))
+            ckpt_msg = f"💾 Checkpoint saved: {run_name}/pvtvae_epoch_{epoch}.pth"
             print(ckpt_msg)
             with open(log_file, "a", encoding="utf-8") as f:
                 f.write(ckpt_msg + "\n")

@@ -4,7 +4,7 @@
 학습(train.py)·평가(evaluate.py)와 동일한 corruption.py 주입기로 held-out 테스트
 파일에 클리핑을 주입하고, train.py 설정(LAMBDA_*/RUN_TAG)과 일치하는 run 폴더의
 체크포인트로 교정한 결과를 demo_results/ 에 저장한다.
-→ 이후 'python AI_model/dataset_pipeline.py' (VISUALIZE=COMPARE)로 시각화.
+→ 이후 'python AI_model/motion_viz.py compare' 로 시각화.
 
 [구판과의 차이 — §4.1 반영]
   - 주입: 구판의 'LeftUpperArm 로컬 +Z 90° 고정' 주입은 §4.1 학습 분포에서
@@ -17,6 +17,18 @@
     (학습에 본 적 없는 데이터라는 정직한 데모).
   - 주입이 충돌을 만들지 못하면 다른 파일로 재추첨한다 (2026-07-06 실증:
     같은 회전도 포즈에 따라 충돌 0이 될 수 있음 → rejection sampling 필수).
+
+[무결성 보강 — 2026-08-07]
+  - DEMO_SCENARIO는 DEMO_SCENARIOS 화이트리스트로 검증한다. 구판의 이항 if/else는
+    오타('Persistent' 등)를 조용히 persistent로 처리하고 그 잘못된 문자열을
+    demo_meta.json에 기록해 재현 기록을 거짓으로 만들었다.
+  - 후보 채택/차선 폴백은 meta['collided']가 아니라 '깊이'로 판정한다. collided는
+    '충돌 여부'가 아니라 '주입기 내부 임계 통과 여부'라서, 구판에서는 차선 폴백이
+    도달 불가능한 죽은 코드였고 1.9cm로 실제 충돌한 데모가 "충돌 실패"로 보고됐다.
+  - DEMO_MIN_DEPTH_CM이 두 시나리오 모두에 적용된다 (구판은 persistent일 때
+    하드코딩 1.0으로 대체되어 무력했다). 지속형은 주입기 상한 4cm로 clamp.
+  - TARGET_FILE 사용 시 held-out 여부를 실제로 확인해 화면과 meta에 정직하게 표기한다.
+  - DEMO_SEED는 환경변수로 덮어쓸 수 있다 → 잘 나온 데모를 소스 수정 없이 재현.
 """
 import os
 import json
@@ -41,18 +53,37 @@ SEQ_LEN = 30
 # 데모 파라미터 — demo_results/demo_meta.json 에 기록되어 동일 데모 재생성 가능
 # =====================================================================
 DEMO_SCENARIO = 'persistent'    # 'transient'(글리치 복원) 또는 'persistent'(최소 사영)
+
+# 시나리오별 (주입 함수, 채택 깊이 하한). evaluate.py의 시나리오 중 이 둘만 데모가 지원한다
+# ('clean'은 보여줄 충돌이 없고, 'legacy80'은 §4.1 학습 분포에서 의도적으로 제외된 계열).
+# ⚠️ persistent 하한은 주입기의 목표 범위 상한(persistent_depth_range_cm[1]=4.0cm)을
+#    넘길 수 없다 — 넘기면 어떤 후보도 채택되지 못해 영구 실패한다. 아래에서 clamp한다.
+DEMO_SCENARIOS = {
+    'transient':  corruption.inject_transient,
+    'persistent': corruption.inject_persistent,
+}
 DEMO_SEED = random.randrange(0, 4000)           # 파일/주입 추첨 시드 — 바꾸면 다른 데모가 나온다
-TARGET_FILE = ""               # 지정 시 해당 .pt 파일 고정 (재현용), 빈 문자열 = 추첨
-DEMO_MIN_DEPTH_CM = 2.0        # 화면에서 잘 보이는 최소 주입 깊이 — 미달 시 파일 재추첨
+DEMO_SEED = int(os.environ.get("DEMO_SEED", DEMO_SEED))   # 재현: DEMO_SEED=1234 로 고정 실행 가능
+# 지정 시 해당 .pt 파일 고정 (재현용), 빈 문자열 = 추첨.
+# 현재 값: inject_viz.py가 seed=1234로 뽑은 파일과 동일 — 주입 시각화 gif와 데모가
+# 같은 모션을 쓰도록 맞춘 것이다 (DEMO_SEED=1234와 함께 쓰면 주입 결과까지 일치).
+TARGET_FILE = "" #processed_motions_VMC/dataset-1_call_normal_001.pt
+DEMO_MIN_DEPTH_CM = 2.0        # 화면에서 잘 보이는 최소 주입 깊이 — 두 시나리오 모두에 적용
 MAX_FILE_TRIES = 30            # 재추첨 상한 (초과 시 그때까지 최선의 후보 사용)
 
-# 주입 '형태'는 학습/평가와 동일한 설계 기본값. 단 transient의 최소 깊이 하한만
-# 데모 가시성 기준(DEMO_MIN_DEPTH_CM)으로 올린다 — 주입기 내부 재추첨이 깊은
-# 충돌을 우선 채택하게 될 뿐, 각도/길이 분포(U[15°,70°], 5~20프레임)는 그대로다.
+# 주입 '형태'는 학습/평가와 동일한 설계 기본값. transient만 주입기 '내부' 재추첨 하한을
+# 데모 가시성 기준으로 올린다 (각도/길이 분포 U[15°,70°]·5~20프레임은 그대로).
 DEMO_CFG = corruption.make_cfg(transient_min_depth_cm=max(0.3, DEMO_MIN_DEPTH_CM))
 
 
 def create_demo():
+    # 오타로 인한 '조용한 persistent 데모'를 차단한다. 구판은 이항 if/else였기 때문에
+    # 'Persistent'/'transiant' 같은 오타가 예외 없이 지속형으로 떨어지고, 그 잘못된
+    # 문자열이 demo_meta.json에 그대로 기록되어 재현 기록이 거짓이 되었다.
+    # (evaluate.py:390의 화이트리스트 검증과 동일한 정책)
+    if DEMO_SCENARIO not in DEMO_SCENARIOS:
+        raise ValueError(f"알 수 없는 시나리오: {DEMO_SCENARIO!r} "
+                         f"(지원: {sorted(DEMO_SCENARIOS)})")
     print(f"[발표용 데모 생성기] §4.1 디클리핑 데모 — scenario='{DEMO_SCENARIO}'")
 
     # 1. 체크포인트: train.py 설정과 일치하는 run 폴더에서 최신 epoch 가중치 로드
@@ -85,14 +116,28 @@ def create_demo():
     #    파일을 재추첨한다 (rejection sampling — 주입은 포즈에 따라 무충돌일 수 있음).
     motions_dir = "processed_motions_VMC" if os.path.exists("processed_motions_VMC") \
         else "../processed_motions_VMC"
-    inject_fn = corruption.inject_transient if DEMO_SCENARIO == 'transient' \
-        else corruption.inject_persistent
-    min_depth = DEMO_MIN_DEPTH_CM if DEMO_SCENARIO == 'transient' else 1.0
+    inject_fn = DEMO_SCENARIOS[DEMO_SCENARIO]
+    # 채택 하한은 두 시나리오 모두 DEMO_MIN_DEPTH_CM(가시성 기준). 단 persistent는 주입기가
+    # 깊이를 [1,4]cm로 통제하므로 그 상한을 넘는 요구는 달성 불가 → 4cm로 clamp한다.
+    min_depth = DEMO_MIN_DEPTH_CM
+    if DEMO_SCENARIO == 'persistent':
+        pmax = DEMO_CFG['persistent_depth_range_cm'][1]
+        if min_depth > pmax:
+            print(f"⚠️ DEMO_MIN_DEPTH_CM={DEMO_MIN_DEPTH_CM}cm는 지속형 주입 상한({pmax}cm) 초과 "
+                  f"→ {pmax}cm로 낮춰 진행합니다.")
+            min_depth = pmax
 
+    test_files = get_split_files(motions_dir, split='test')
     if TARGET_FILE:
         cands = [TARGET_FILE]
+        # TARGET_FILE은 분할을 우회하므로 held-out 여부를 직접 확인한다. 이 검증이 없으면
+        # 학습에 쓴 파일로 데모를 만들고도 화면에는 '(held-out)'이 찍혀 발표가 부정직해진다.
+        is_heldout = os.path.abspath(TARGET_FILE) in {os.path.abspath(p) for p in test_files}
+        if not is_heldout:
+            print(f"⚠️ TARGET_FILE이 held-out 테스트 분할에 없습니다 — 학습에 사용됐을 수 있습니다.")
     else:
-        cands = get_split_files(motions_dir, split='test')
+        is_heldout = True
+        cands = list(test_files)
         random.Random(DEMO_SEED).shuffle(cands)
 
     chosen = None   # (파일, 클린 원본, 손상본, 주입 meta)
@@ -105,10 +150,15 @@ def create_demo():
         rng = random.Random(DEMO_SEED + 10007 * try_i)
         corrupted, meta = inject_fn(clean, physics, DEMO_CFG, rng, COLLIDING_PAIRS)
         depth = meta.get('max_depth_cm', 0.0)
-        if meta.get('collided') and depth >= min_depth:
+        # ⚠️ meta['collided']는 '충돌했는가'가 아니라 '주입기 내부 임계를 통과했는가'다
+        #    (corruption.py:224 / 342). transient는 임계 미달이면 실제로 관통했어도
+        #    collided=False가 되므로, 차선 후보 추적은 collided가 아니라 depth로 한다.
+        #    이 구분이 없으면 아래 best 폴백이 영원히 도달 불가능한 죽은 코드가 되고,
+        #    1.9cm로 '충돌한' 데모가 "충돌을 만들지 못했습니다"로 잘못 보고된다.
+        if depth >= min_depth:
             chosen = (fpath, clean, corrupted, meta)
             break
-        if meta.get('collided') and (best is None or depth > best[3]['max_depth_cm']):
+        if depth > 0.0 and (best is None or depth > best[3].get('max_depth_cm', 0.0)):
             best = (fpath, clean, corrupted, meta)
     if chosen is None:
         if best is None:
@@ -116,9 +166,11 @@ def create_demo():
                   f"DEMO_SEED를 바꿔 다시 시도하세요.")
             return
         chosen = best
-        print(f"⚠️ 목표 깊이 {min_depth}cm 이상 실패 — 가장 깊은 후보로 진행합니다.")
+        print(f"⚠️ 목표 깊이 {min_depth}cm 이상 실패 — 가장 깊은 후보"
+              f"({best[3].get('max_depth_cm', 0.0):.2f}cm)로 진행합니다.")
     target_file, _clean_motion, demo_motion, inject_meta = chosen
-    print(f"소스 파일(held-out): {target_file}")
+    split_label = "held-out" if is_heldout else "⚠️ 분할 외(학습 데이터일 수 있음)"
+    print(f"소스 파일({split_label}): {target_file}")
     print(f"주입: {inject_meta['type']} | bone={inject_meta['bone']} | "
           f"frames={inject_meta['frames']} | depth={inject_meta['max_depth_cm']:.2f} cm")
 
@@ -144,11 +196,16 @@ def create_demo():
     meta = {
         "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "source_file": str(target_file),
-        "source_split": "test (held-out)" if not TARGET_FILE else "manual",
+        # 'manual'로 뭉뚱그리지 않고 실제 분할 확인 결과를 기록한다 — 나중에 이 데모가
+        # 정직했는지(학습 데이터가 아니었는지) meta만 보고 판정할 수 있어야 한다.
+        "source_split": ("test (held-out)" if is_heldout
+                         else "manual (NOT in held-out test split)"),
+        "held_out": is_heldout,
         "checkpoint": ckpt_path,
         "seq_len": SEQ_LEN,
         "demo_scenario": DEMO_SCENARIO,
         "demo_seed": DEMO_SEED,
+        "min_depth_cm_used": min_depth,   # clamp 후 실제 채택 기준
         "inject": inject_meta,
         "max_pen_before_cm": round(maxpen_b, 2),
         "max_pen_after_cm": round(maxpen_a, 2),
@@ -158,7 +215,9 @@ def create_demo():
     with open(os.path.join(results_dir, "demo_meta.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2, ensure_ascii=False)
 
-    print("준비 완료! 이제 'python AI_model/dataset_pipeline.py' (VISUALIZE=COMPARE)로 결과를 확인하세요.")
+    print(f"이 데모 재현: DEMO_SEED={DEMO_SEED} python AI_model/demo_maker.py "
+          f"(+ TARGET_FILE='{target_file}' 고정 시 완전 동일)")
+    print("준비 완료! 이제 'python AI_model/motion_viz.py compare' 로 결과를 확인하세요.")
 
 
 if __name__ == "__main__":

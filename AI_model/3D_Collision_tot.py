@@ -10,6 +10,10 @@ import itertools
 # ⚙️ 1. 시스템 하이퍼파라미터 및 예외 룰
 # ==========================================
 # 아담한 체형 스케일에 맞춘 캡슐 반경 축소 (단위: 미터)
+# ⚠️ 이 테이블은 dataset_pipeline.BONE_RADII 와 '이름은 같지만 값이 다르다'
+#    (여기: Hips 0.08 / Spine 0.12 / Chest 0.10  vs  파이프라인: 0.06 / 0.04 / 0.08).
+#    이 스크립트는 학습/평가 파이프라인과 무관한 독립 시각화용이므로 별도 상수로 둔다.
+#    두 값을 통일하면 '동작 변경'이 되므로 임의로 맞추지 말 것.
 BONE_RADII = {
     'Hips': 0.08, 'Spine': 0.12, 'Chest': 0.10, 'Neck': 0.03, 'Head': 0.08,
     'LeftShoulder': 0.03, 'LeftUpperArm': 0.03, 'LeftLowerArm': 0.02, 'LeftHand': 0.02,
@@ -171,20 +175,18 @@ for f in frames:
         if min_topo_dist <= 2: continue
 
         # [필터링 2] 양 다리 간의 충돌 무시 (차렷 자세 등)
+        # 기본 판정 기준: 두 캡슐 끝점(자식 뼈) 반지름의 합
+        threshold = BONE_RADII[c1] + BONE_RADII[c2]
         if IGNORE_LEG_TO_LEG_COLLISION:
             is_leg1 = p1 in LEG_BONES or c1 in LEG_BONES
             is_leg2 = p2 in LEG_BONES or c2 in LEG_BONES
             if is_leg1 and is_leg2:
                 # 다리끼리의 검사일 경우, 충돌 허용치를 넓혀줍니다.
                 # 캡슐의 두께(Radius)를 40%로 대폭 깎아서 뼈대 중심끼리 정말 가까워졌을 때만 충돌로 판정합니다.
-                threshold = (BONE_RADII[c1] + BONE_RADII[c2]) * 0.4 
-            else:
-                # 팔-가슴 등 일반적인 부위는 원래 두께 그대로 엄격하게 검사합니다.
-                threshold = BONE_RADII[c1] + BONE_RADII[c2]
-            
+                threshold *= 0.4
+
         dist = closest_distance_between_lines(global_pos[p1], global_pos[c1], global_pos[p2], global_pos[c2])
-        threshold = BONE_RADII[c1] + BONE_RADII[c2]
-        
+
         if dist < threshold:
             collisions_in_this_frame.append(((p1, c1), (p2, c2)))
             

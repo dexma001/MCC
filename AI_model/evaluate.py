@@ -60,11 +60,118 @@ EVAL_CORRUPTION_CFG = corruption.make_cfg()   # 주입 '형태' 파라미터는 
 #   이는 지금 헤드라인에서 강등하는 persistent MPJPE와 정확히 같은 함정이므로,
 #   PCK는 아래 두 시나리오에서만 계산하고 나머지는 CSV에 빈칸으로 남긴다.
 # =====================================================================
-PCK_THRESHOLDS_CM = (1.0, 2.0, 5.0)
+#
+# 📌 10cm 추가 (2026-08-02, Tier-1 클로즈아웃): 5cm까지의 pck_frame_*가 전 임계값에서
+#   0.0%로 나와 '프레임 단위 R1 지표'가 판별력을 완전히 잃었다. 버그가 아니라 오차 분포가
+#   이봉형(≈1/3이 <1cm, ≈1/3이 >5cm — FK 사슬 누적으로 말단이 지배)이라는 사실의 귀결이다.
+#   느슨한 임계값 하나를 더해 판별력을 복구한다. ⚠️ 10cm에서도 0.0%로 나온다면 그것 또한
+#   '정직한 결과'로 그대로 보고한다 (임계값을 값이 나올 때까지 조정하지 않는다).
+PCK_THRESHOLDS_CM = (1.0, 2.0, 5.0, 10.0)
 PCK_SCENARIOS = ("clean", "transient")
 
 # [항목 1] 추론 시간 측정에서 버릴 워밍업 파일 수 (CUDA 컨텍스트 생성/커널 캐싱 구간 제외)
 TIMING_WARMUP_FILES = 5
+
+# =====================================================================
+# [Tier 2 / cOKS] FK 자손 집합 — 부수변화 마스크의 핵심.
+#
+# 🚨 왜 '주입 본 1개'로는 부족한가:
+#   intent_mae는 로컬 쿼터니언 공간에서 동작하므로 주입 본만 빼면 충분했다 (자손의 로컬
+#   회전은 주입에 영향받지 않는다). cOKS는 FK '위치' 공간에서 동작하므로 사정이 완전히 다르다.
+#   physics_module.forward_kinematics가
+#       global_pos[bone] = global_pos[parent] + rotate(global_rot[parent], offset)
+#   이므로 LeftUpperArm에 회전을 주입하면 LeftLowerArm·LeftHand의 '위치'가 전부 이동한다.
+#   따라서 자손을 마스크에서 빼지 않으면, 모델이 주입을 올바르게 되돌려 손이 클린 위치로
+#   돌아왔을 때 d_hand(손상 입력 대비)가 오히려 커져 **정당한 교정이 부수 변화로 오계상**된다.
+#   (= 지표의 부호가 뒤집힌다.)
+# =====================================================================
+def _build_fk_descendant_sets():
+    """본 이름 → '자신 + 모든 FK 자손'의 관절 인덱스 리스트. 모듈 로드 시 1회만 계산."""
+    children = {b: [] for b in BONE_NAMES}
+    for c, p in PARENTS.items():
+        if p is not None:
+            children[p].append(c)
+    out = {}
+    for b in BONE_NAMES:
+        acc, stack = set(), [b]
+        while stack:
+            cur = stack.pop()
+            if cur in acc:
+                continue
+            acc.add(cur)
+            stack.extend(children[cur])
+        out[BONE_MAP[b]] = sorted(BONE_MAP[x] for x in acc)
+    return out
+
+
+FK_DESCENDANTS = _build_fk_descendant_sets()
+
+
+def get_collateral_mask(meta):
+    """
+    부수변화 평가 대상 관절 마스크 V (True = 평가에 포함).
+    주입 본과 그 FK 자손을 제외한다. clean 시나리오 / persistent 클린 폴백(bone_idx 없음)
+    에서는 전 관절(21개)이 대상이 되어 do-no-harm 수치가 된다.
+    """
+    mask = torch.ones(len(BONE_NAMES), dtype=torch.bool)
+    if meta is not None and meta.get('type') != 'clean' and meta.get('bone_idx') is not None:
+        mask[FK_DESCENDANTS[meta['bone_idx']]] = False
+    return mask
+
+
+def compute_coks_scale(physics_engine):
+    """
+    cOKS의 골격 스케일 s (m) = Hips→Head 오프셋 체인 길이. ⚠️ 하드코딩 금지 —
+    physics_engine.bone_offsets에서 런타임 계산한다. 다른 아바타로 옮길 때 s만 다시 재면
+    k_i 테이블은 그대로 두고 허용오차가 체격에 비례해 자동 스케일된다.
+    """
+    s, b = 0.0, 'Head'
+    while PARENTS[b] is not None:
+        s += float(torch.norm(physics_engine.bone_offsets[b]))
+        b = PARENTS[b]
+    return s
+
+
+def make_coks_sigmas(scale_m):
+    """
+    사전등록한 두 가지 σ 정의를 '함께' 반환한다 (사후에 유리한 쪽을 고르지 못하게 하는 장치).
+      - radii  : k_i = BONE_RADII[i] / s  →  σ_i = s·k_i = BONE_RADII[i] (2~8cm, 관절별 가중)
+      - uniform: k_i = R̄ / s             →  σ_i = R̄ = 21개 반지름 평균 (≈3.52cm, 전 관절 동일)
+    발명 상수 0개 — 둘 다 이미 존재하고 클린 데이터에서 잘 보정됨이 실증된 BONE_RADII에서만 파생.
+    σ를 s·k로 분해해 두는 이유는 다중 아바타 확장을 공짜로 만들기 위함이다.
+    """
+    radii = torch.tensor([BONE_RADII[b] for b in BONE_NAMES], dtype=torch.float32)
+    k_radii = radii / scale_m
+    k_uniform = torch.full_like(k_radii, float(radii.mean()) / scale_m)
+    return scale_m * k_radii, scale_m * k_uniform
+
+
+def calculate_coks_terms(gp_out, gp_in, mask, sigma_radii, sigma_uniform):
+    """
+    [부수 변화 — 위치, Tier 2] 기준 포즈를 '클린'이 아니라 **모델 입력(손상 입력)**으로 두는
+    OKS 계열 지표. 반환: (coks_radii, coks_uniform, collateral_pos_cm)
+
+        cOKS = (1/|V|) Σ_{i∈V} exp( −d_i² / (2 σ_i²) ),   d_i = ‖FK(출력)_i − FK(입력)_i‖
+
+    기준 포즈를 바꾼 것이 전부이고, 그 한 가지가 persistent/legacy80에서 MPJPE·3DPCK가 겪는
+    역상관 함정("원래대로 되돌릴수록 점수가 오른다")을 구조적으로 회피한다.
+    → 마스터 원칙: **의도 문제는 거리 커널 문제가 아니라 기준 포즈 문제다.**
+
+    포화(saturation)가 여기서는 타당한 이유: 충실도 지표에서는 해롭지만 부수변화 지표에서는
+    "이미 크게 건드린 관절"을 더 세밀히 등급 나눌 실익이 없다 (5cm 밀림과 15cm 밀림은 둘 다
+    과잉 보정 실패다). 즉 exp 커널의 부호는 '기준 포즈'에 따라 뒤집힌다.
+
+    ⚠️ 그래도 σ(2~3.5cm)에 비해 관측 오차가 크면 전부 0에 몰려 판별력을 잃을 수 있으므로
+       (pck_frame_*가 전부 0.0%가 된 것과 같은 실패 양식) 비포화 동반 지표
+       collateral_pos_cm(마스크 적용 평균 거리, cm)을 반드시 함께 읽는다.
+    """
+    d = torch.norm(gp_out - gp_in, dim=-1)              # [F, J] (m)
+    dm = d[:, mask]                                     # [F, |V|]
+    sr = sigma_radii[mask]
+    su = sigma_uniform[mask]
+    kr = torch.exp(-(dm ** 2) / (2.0 * sr ** 2)).mean().item()
+    ku = torch.exp(-(dm ** 2) / (2.0 * su ** 2)).mean().item()
+    return kr, ku, dm.mean().item() * 100.0
 
 
 def load_run_config(run_dir):
@@ -108,7 +215,13 @@ def append_results_csv(row, csv_path="evaluate_results.csv"):
               # [항목 3] 동역학 보존 (전 시나리오 기록 — clean에서는 do-no-harm 수치가 된다)
               "intent_dyn_cm",
               # [항목 1] 추론 시간 (R4) — ⚠️ 배포 지연시간이 아니라 '상한 프록시'
-              "infer_ms_window_mean", "infer_ms_window_p95", "infer_ms_per_frame", "infer_device"]
+              "infer_ms_window_mean", "infer_ms_window_p95", "infer_ms_per_frame", "infer_device",
+              # ---- Tier 2 신규 컬럼 (2026-08-02) — 위와 동일한 '맨 뒤에만' 규칙 적용 -------
+              # [cOKS] 부수 변화(위치 공간). 기준 포즈 = 손상 입력. 전 시나리오 기록.
+              "coks_radii", "coks_uniform", "collateral_pos_cm", "coks_scale_m",
+              # [Tier-1 클로즈아웃] pck_frame_*가 전 임계값 0.0%라 프레임 단위 R1 지표가
+              #   판별력을 잃은 상태를 복구하기 위한 느슨한 임계값 (게이팅은 기존과 동일).
+              "pck_10cm", "pck_frame_10cm"]
     exists = os.path.exists(csv_path)
     if exists:
         with open(csv_path, "r", newline="", encoding="utf-8") as f:
@@ -279,7 +392,7 @@ def make_scenario_input(scenario, clean, file_idx, physics_engine):
 
 def evaluate(scenarios=None, limit=0):
     scenarios = scenarios or RUN_SCENARIOS
-    print(f"⏳ [V7] Held-out 테스트셋 유형별 시나리오 평가 시작 — scenarios={scenarios}\n")
+    print(f"⏳ Held-out 테스트셋 유형별 시나리오 평가 시작 — scenarios={scenarios}\n")
 
     # ---- 경로/모델/데이터 준비 --------------------------------------
     motions_dir = "processed_motions_VMC" if os.path.exists("processed_motions_VMC") else "../processed_motions_VMC"
@@ -305,6 +418,12 @@ def evaluate(scenarios=None, limit=0):
     physics_engine = DifferentiablePhysics(PARENTS, BONE_RADII)
     ALL_PAIRS = get_all_eval_pairs()
 
+    # [cOKS] 골격 스케일 s와 사전등록된 두 σ 정의를 실행 시작 시 1회 계산한다.
+    coks_scale = compute_coks_scale(physics_engine)
+    sigma_radii, sigma_uniform = make_coks_sigmas(coks_scale)
+    print(f"✅ cOKS 스케일 s = {coks_scale:.4f} m (Hips→Head 오프셋 체인, 런타임 계산) | "
+          f"σ_uniform = {float(sigma_uniform[0]) * 100:.2f} cm")
+
     # 🚨 학습에 쓰지 않은 held-out 파일만 평가 대상으로 사용
     test_files = [f for f in get_split_files(motions_dir, split='test')]
     if not test_files:
@@ -322,17 +441,24 @@ def evaluate(scenarios=None, limit=0):
 
     for scenario in scenarios:
         _eval_one_scenario(scenario, model, physics_engine, ALL_PAIRS, test_files,
-                           lam_recon, lam_phys, run_epochs, run_tag)
+                           lam_recon, lam_phys, run_epochs, run_tag,
+                           coks_scale, sigma_radii, sigma_uniform)
 
 
 def _eval_one_scenario(scenario, model, physics_engine, ALL_PAIRS, test_files,
-                       lam_recon, lam_phys, run_epochs, run_tag):
+                       lam_recon, lam_phys, run_epochs, run_tag,
+                       coks_scale, sigma_radii, sigma_uniform):
     corrupt = scenario != "clean"
 
     # ---- 테스트셋 전체 순회하며 파일별 지표 수집 --------------------
     col_before, col_after = [], []
     mpjpe_list, mae_list, intent_list = [], [], []
     intent_dyn_list = []            # [항목 3] 동역학 보존 (전 시나리오)
+    # [cOKS] 부수 변화(위치 공간) — 본 지표 / 사전등록 대조군 / 비포화 동반 지표.
+    #   3DPCK와 정반대로 '전 시나리오' 계산한다: 기준이 손상 입력이라 역상관 함정이
+    #   구조적으로 없기 때문이다. clean에서는 gp_input==gp_clean이므로 do-no-harm 수치가 된다.
+    coks_r_list, coks_u_list, collat_list = [], [], []
+    mask_size_hist = {}             # |V| 분포 (자손 마스킹 누락을 직접 잡는 검증용)
     jit_before, jit_after = [], []
     bonelen_after = []
     n_used = 0
@@ -468,6 +594,17 @@ def _eval_one_scenario(scenario, model, physics_engine, ALL_PAIRS, test_files,
             #   얼마나 왜곡하는가"를 재는 do-no-harm 수치가 된다 → 전 시나리오 기록.
             intent_dyn_list.append(calculate_intent_dyn(gp_corr, gp_input))
 
+            # (3-d) [cOKS] 부수 변화 — 위치 공간. intent_dyn(동역학)의 '정적 포즈' 짝.
+            #   마스크는 주입 본 + 그 FK 자손을 제외한다 (get_collateral_mask의 주석 참조 —
+            #   자손을 빼지 않으면 정당한 교정이 부수 변화로 오계상되어 지표 부호가 뒤집힌다).
+            cmask = get_collateral_mask(meta)
+            mask_size_hist[int(cmask.sum())] = mask_size_hist.get(int(cmask.sum()), 0) + 1
+            _kr, _ku, _cp = calculate_coks_terms(gp_corr, gp_input, cmask,
+                                                 sigma_radii, sigma_uniform)
+            coks_r_list.append(_kr)
+            coks_u_list.append(_ku)
+            collat_list.append(_cp)
+
             # (4) Jitter(참고 지표): 부드러움
             jit_before.append(calculate_acceleration_jitter(gp_input))
             jit_after.append(calculate_acceleration_jitter(gp_corr))
@@ -497,6 +634,9 @@ def _eval_one_scenario(scenario, model, physics_engine, ALL_PAIRS, test_files,
     bl_m, _ = ms(bonelen_after)
     intent_m = float(np.mean(intent_list)) if intent_list else None
     intent_dyn_m = float(np.mean(intent_dyn_list)) if intent_dyn_list else None
+    coks_r_m = float(np.mean(coks_r_list)) if coks_r_list else None
+    coks_u_m = float(np.mean(coks_u_list)) if coks_u_list else None
+    collat_m = float(np.mean(collat_list)) if collat_list else None
 
     # [항목 1] 추론 시간 집계 — 워밍업 구간 제외 후 평균/p95.
     #   p95를 함께 두는 이유: R4의 실패는 평균이 아니라 '스파이크'에서 발생한다
@@ -620,7 +760,25 @@ def _eval_one_scenario(scenario, model, physics_engine, ALL_PAIRS, test_files,
         print(f"  ▶ 동역학 보존 intent_dyn : {intent_dyn_m:.4f} cm/frame²  ({role}, 낮을수록 좋음)")
         print("    ↳ ‖Δ²(출력) − Δ²(입력)‖ — 상수 재배치에 불변이라 정당한 교정을 벌하지 않는다.")
         print("       persistent에서는 마스크 없이 계산되어 '배포 스트림에서도 측정 가능'하다.")
-        print("       ⚠️ 정적 의미 오류에 맹목 → 단독 판단 금지, 포즈/의미 항(cOKS, Tier 2)과 병용할 것.")
+        print("       ⚠️ 정적 의미 오류에 맹목(정지 제스처가 뒤바뀌어도 0) → 단독 판단 금지.")
+        print("       ⚠️ 현재 이 값은 '출력 지터'에 지배되고 있다 (corr(intent_dyn, jitter_after)")
+        print("          = 0.997, 20행 실측). v1.5 출력 필터가 들어가 jitter_after가 입력 수준")
+        print("          (~0.5)까지 내려오기 전까지는 **λ별 노이즈 감시 지표로만** 읽을 것.")
+        print("          시나리오 간 비교나 '의도 보존' 판정에 사용 금지.")
+    # ── cOKS = intent_dyn의 정적 포즈 짝. 이 둘이 갖춰져야 α·동역학 + β·정적 형태가 성립한다.
+    if coks_r_m is not None:
+        vs = "/".join(f"{v}×{n}" for v, n in sorted(mask_size_hist.items()))
+        crole = "do-no-harm(포즈 변경량)" if scenario == "clean" else "부수 변화"
+        print(f"  ▶ cOKS (기준=손상 입력)   : radii {coks_r_m:.4f} / uniform {coks_u_m:.4f}"
+              f"   ({crole}, [0,1] 높을수록 좋음)")
+        print(f"     - 비포화 동반 지표 collateral_pos_cm : {collat_m:.3f} cm  (낮을수록 좋음)")
+        print(f"     - 마스크 |V| 분포 : {vs}  (주입 본 + FK 자손 제외 / s = {coks_scale:.4f} m)")
+        print("    ↳ 기준 포즈를 '클린'이 아니라 '모델 입력'으로 두어, persistent/legacy80에서")
+        print("       MPJPE·3DPCK가 겪는 역상관(되돌릴수록 점수↑)을 구조적으로 회피한다.")
+        print("       uniform은 사전등록 대조군(σ=3.52cm 균등)이다 — 두 값을 항상 나란히 읽어")
+        print("       관절별 가중이 결과를 만든 것인지 검증한다. σ 사후 재조정 금지.")
+        print("       ⚠️ exp 커널은 d≫σ에서 0에 포화한다. 포화가 의심되면 반드시")
+        print("          collateral_pos_cm(비포화, cm)을 판단 근거로 쓸 것.")
     print(f"  ▶ Jitter(참고 지표)        : Before {jb_m:.4f} / After {ja_m:.4f} cm/frame²")
 
     # ── [4] 추론 속도 (R4). 지금까지 한 번도 측정되지 않던 요구사항. ──
@@ -681,6 +839,16 @@ def _eval_one_scenario(scenario, model, physics_engine, ALL_PAIRS, test_files,
         "infer_ms_window_p95": round(infer_ms_p95, 3) if infer_ms_p95 is not None else "",
         "infer_ms_per_frame": round(infer_ms_frame, 4) if infer_ms_frame is not None else "",
         "infer_device": DEVICE,
+        # ---- Tier 2 신규 컬럼 (순서 고정: 반드시 기존 40개 뒤에만) --------------
+        # [cOKS] 전 시나리오 기록 (3DPCK와 달리 게이팅하지 않는다 — 기준이 손상 입력이라
+        #   역상관 함정이 구조적으로 없기 때문. clean에서는 do-no-harm 수치가 된다.)
+        "coks_radii": round(coks_r_m, 4) if coks_r_m is not None else "",
+        "coks_uniform": round(coks_u_m, 4) if coks_u_m is not None else "",
+        "collateral_pos_cm": round(collat_m, 3) if collat_m is not None else "",
+        "coks_scale_m": round(coks_scale, 4),
+        # [Tier-1 클로즈아웃] 느슨한 PCK 임계값 (게이팅은 기존 pck_*와 동일 → 그 외 빈칸)
+        "pck_10cm": round(pck_joint[10.0], 2) if pck_joint else "",
+        "pck_frame_10cm": round(pck_frame[10.0], 2) if pck_frame else "",
     }
     csv_path = append_results_csv(row)
     print(f"📝 시나리오 '{scenario}' 집계 지표가 '{csv_path}'에 기록되었습니다 "
