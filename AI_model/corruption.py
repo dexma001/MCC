@@ -23,15 +23,36 @@ collision_after_root_cause_report.md §7 (2026-07-07 합의).
 타겟은 두 유형 모두 '클린 원본'(v1 Option A): 지속형은 작은 깊이로 제한되어
 클린 타겟 ≈ 최소 사영이므로 정답지가 정직하다.
 
-[구현 노트 — 속도] FK 비용은 텐서 크기가 아니라 '호출 횟수'(21개 본 파이썬 루프)가
-지배한다. 따라서 후보(샘플 × 각도 × 축)를 전부 쌓아 라운드당 '배치 FK 1회'로 깊이를
-평가한다. 샘플별 순차 rejection 대비 배치당 FK 호출이 ~100회 → ~5회로 줄어든다.
+[구현 노트 — 속도 (2026-08-11 개편)]
+  주입은 학습 시간을 지배하는 비용이다(개편 전 실측 210~309ms/batch vs GPU 학습 스텝 37.6ms).
+  비용의 정체는 '텐서 크기'가 아니라 '파이썬에서 띄우는 커널/동기화 횟수'였고, 다음 3가지를
+  배칭해 제거했다 (분석: claude_analysis/corruption_cuda_acceleration_analysis.md):
+
+    1) 레벨별 배치 FK (PenetrationEvaluator) — 스켈레톤은 트리이므로 '같은 깊이의 본은 서로
+       독립'이다. 본 21개 파이썬 루프 → 트리 깊이(≤5) 루프로 줄이고, 페어별 캡슐 거리도
+       인덱스 텐서로 한 번에 계산한다. 참조되지 않는 본은 FK에서 제외(가지치기)한다.
+       ⚠️ PARENTS/BONE_NAMES(21본)는 데이터 계약(quats_84.reshape(...,21,4))이므로 절대
+          줄이지 않는다. 가지치기는 'FK 루프가 방문할 본'만 제한한다.
+    2) _seg_stats 벡터화 — 후보마다 float()를 3번 부르며 동기화하던 것을 [M,3] 텐서 1회
+       전송으로 대체. (CPU에서도 이득이지만 GPU에서는 이것이 없으면 되려 느려진다.)
+    3) 교차-샘플 후보 생성 (_build_candidates) — 샘플마다 후보를 만들던 호출을 라운드당
+       1회로 합친다. 인덱스/각도 배열은 '호스트에서 조립해 한 번에 전송'해야 한다
+       (디바이스에서 원소별로 채우면 전송이 M회 발생해 오히려 느려진다).
+
+  알고리즘·난수 소비 순서·판정 기준은 개편 전과 완전히 동일하며, CPU 경로는 개편 전 코드와
+  '비트 단위로 동일한' 결과를 낸다(회귀 게이트로 검증). 즉 이 개편은 기존 체크포인트/CSV와의
+  비교 가능성을 훼손하지 않는다.
+
+  디바이스: 기본은 CPU(비트 동일 보장). 윈도우 텐서를 CUDA에 올려 호출하면 그대로 GPU에서
+  평가되며 더 빨라지지만, 부동소수점 차이(~1e-7)로 비트 동일은 보장되지 않는다.
 """
 import math
+import weakref
 
+import numpy as np
 import torch
 
-from dataset_pipeline import BONE_MAP
+from dataset_pipeline import BONE_MAP, BONE_NAMES, PARENTS
 
 # 주입 대상 본: 팔 4개(팔↔몸통 / 팔↔팔 페어 유발) + 상부 다리 2개(다리↔다리 페어 유발)
 DEFAULT_INJECT_BONES = [
@@ -118,103 +139,294 @@ def _rand_unit_axis(rng):
             return [x / n for x in v]
 
 
-def _apply_local_delta(window, bone_idx, frames, axis, angles_rad):
+# ------------------------------------------------------------------
+# 침투 깊이 평가기 — 레벨별 배치 FK + 페어 동시 캡슐 거리
+# ------------------------------------------------------------------
+class PenetrationEvaluator:
     """
-    window [S, 87]의 특정 본에, 지정 프레임들만 로컬 추가 회전(축·각)을 적용한 복사본 반환.
-    inject_arm_collision과 같은 규약: q_new = q ⊗ delta (로컬 프레임에서 추가 회전).
+    고정 페어 집합에 대한 침투 깊이 평가기. 인덱스·오프셋·임계값을 생성 시점에 한 번만
+    준비해 두고, 이후에는 후보 묶음 [M, S, 87]을 통째로 받아 프레임별 깊이 [M, S]를 낸다.
+
+    physics_module.DifferentiablePhysics와 '수치적으로 동일'하되 다음이 다르다:
+      - FK가 본 21개 파이썬 루프 대신 '트리 깊이별 배치'로 돈다 (커널 런치 21회 → ≤5회).
+        같은 깊이의 본은 부모가 이미 확정되어 서로 독립이므로 순서를 바꿔도 각 원소의
+        연산 자체는 동일하다 → 비트 단위로 같은 결과가 나온다.
+      - 페어 집합이 참조하지 않는 본(및 그 조상이 아닌 본)은 아예 계산하지 않는다.
+        4페어 기준 21본 → 17본.
+      - 페어별 캡슐 거리를 루프 대신 인덱스 텐서 하나로 동시에 구한다.
+
+    ⚠️ 페어 집합에 종속적이다(인덱스·가지치기가 사전 계산됨). 다른 페어 집합에는
+       반드시 별도 인스턴스를 쓸 것 — 재사용하면 결과가 조용히 달라진다.
+       (모듈 내부에서는 _get_evaluator가 (physics, pairs, device)별로 캐시한다.)
     """
-    out = window.clone()
-    sl = slice(3 + bone_idx * 4, 3 + bone_idx * 4 + 4)
-    dev, dt = window.device, window.dtype
 
-    ang = torch.tensor(angles_rad, dtype=dt, device=dev)          # [n]
-    ax = torch.tensor(axis, dtype=dt, device=dev)                 # [3]
-    half = ang * 0.5
-    deltas = torch.cat([ax.unsqueeze(0) * torch.sin(half).unsqueeze(-1),
-                        torch.cos(half).unsqueeze(-1)], dim=-1)   # [n, 4]
+    def __init__(self, physics, pairs, device='cpu', dtype=torch.float32, prune=True):
+        self.device = torch.device(device)
+        self.dtype = dtype
+        self.n_bones = len(BONE_NAMES)
+        self.pairs = tuple(tuple(map(tuple, p)) for p in pairs)
 
-    idx = torch.tensor(frames, dtype=torch.long, device=dev)
-    q = out[idx, sl]                                              # [n, 4]
-    qn = _quat_mul(q, deltas)
-    out[idx, sl] = qn / (qn.norm(dim=-1, keepdim=True) + 1e-8)
-    return out
+        # --- FK에서 실제로 필요한 본만 남긴다 (페어가 쓰는 본 + 그 조상 전체) ---
+        need = set()
+        for (a, b), (c, d) in pairs:
+            need |= {a, b, c, d}
+        if prune:
+            keep = set()
+            for bone in need:
+                cur = bone
+                while cur is not None:
+                    keep.add(cur)
+                    cur = PARENTS[cur]
+        else:
+            keep = set(BONE_NAMES)
+
+        # --- 본을 트리 깊이별로 묶는다 (같은 깊이 = 동시 계산 가능) ---
+        depth = {}
+
+        def _depth_of(b):
+            if b not in depth:
+                p = PARENTS[b]
+                depth[b] = 0 if p is None else _depth_of(p) + 1
+            return depth[b]
+
+        for b in BONE_NAMES:
+            _depth_of(b)
+
+        self.levels = []
+        for lv in range(1, max(depth[b] for b in keep) + 1):
+            bones_at_lv = [b for b in BONE_NAMES if depth[b] == lv and b in keep]
+            if not bones_at_lv:
+                continue
+            self.levels.append((
+                torch.tensor([BONE_MAP[b] for b in bones_at_lv],
+                             dtype=torch.long, device=self.device),
+                torch.tensor([BONE_MAP[PARENTS[b]] for b in bones_at_lv],
+                             dtype=torch.long, device=self.device),
+                torch.stack([physics.bone_offsets[b] for b in bones_at_lv]).to(self.device, dtype),
+            ))
+
+        self.hips_i = BONE_MAP['Hips']
+
+        # --- 페어별 캡슐 끝점 인덱스와 임계값(반지름 합) ---
+        self.p1i = torch.tensor([BONE_MAP[p[0][0]] for p in pairs], dtype=torch.long, device=self.device)
+        self.q1i = torch.tensor([BONE_MAP[p[0][1]] for p in pairs], dtype=torch.long, device=self.device)
+        self.p2i = torch.tensor([BONE_MAP[p[1][0]] for p in pairs], dtype=torch.long, device=self.device)
+        self.q2i = torch.tensor([BONE_MAP[p[1][1]] for p in pairs], dtype=torch.long, device=self.device)
+        self.thr = torch.tensor([physics.bone_radii[p[0][1]] + physics.bone_radii[p[1][1]]
+                                 for p in pairs], dtype=dtype, device=self.device)
+
+    # -- 쿼터니언 연산 (physics_module과 동일 규약; unbind는 인덱싱과 수치 동일) --
+    @staticmethod
+    def _qmul(q1, q2):
+        x1, y1, z1, w1 = q1.unbind(-1)
+        x2, y2, z2, w2 = q2.unbind(-1)
+        return torch.stack([
+            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2], dim=-1)
+
+    @staticmethod
+    def _qrot(q, v):
+        q_xyz = q[..., :3]
+        t = 2.0 * torch.cross(q_xyz, v, dim=-1)
+        return v + q[..., 3:4] * t + torch.cross(q_xyz, t, dim=-1)
+
+    def _capsule_distance(self, p1, q1, p2, q2):
+        """Lumelsky 선분-선분 최단 거리. physics_module.capsule_distance의 배치판."""
+        SMALL_NUM = 1e-8
+        u = q1 - p1
+        v = q2 - p2
+        w = p1 - p2
+        a = (u * u).sum(-1)
+        b = (u * v).sum(-1)
+        c = (v * v).sum(-1)
+        d = (u * w).sum(-1)
+        e = (v * w).sum(-1)
+        D = a * c - b * b
+        sD, tD = D, D
+
+        degenerate = D < SMALL_NUM
+        sN = torch.where(degenerate, torch.zeros_like(D), b * e - c * d)
+        tN = torch.where(degenerate, e, a * e - b * d)
+        tD = torch.where(degenerate, c, tD)
+
+        m = sN < 0.0
+        sN = torch.where(m, torch.zeros_like(sN), sN)
+        tN = torch.where(m, e, tN)
+        tD = torch.where(m, c, tD)
+
+        m = sN > sD
+        sN = torch.where(m, sD, sN)
+        tN = torch.where(m, e + b, tN)
+        tD = torch.where(m, c, tD)
+
+        zeros = torch.zeros_like(a)
+
+        m = tN < 0.0
+        tN = torch.where(m, torch.zeros_like(tN), tN)
+        sN = torch.where(m, torch.clamp(-d, min=zeros, max=a), sN)
+        sD = torch.where(m, a, sD)
+
+        m = tN > tD
+        tN = torch.where(m, tD, tN)
+        sN = torch.where(m, torch.clamp(-d + b, min=zeros, max=a), sN)
+        sD = torch.where(m, a, sD)
+
+        sc = torch.where(sN.abs() < SMALL_NUM, torch.zeros_like(sN),
+                         sN / torch.clamp(sD, min=SMALL_NUM)).unsqueeze(-1)
+        tc = torch.where(tN.abs() < SMALL_NUM, torch.zeros_like(tN),
+                         tN / torch.clamp(tD, min=SMALL_NUM)).unsqueeze(-1)
+
+        dP = w + (sc * u) - (tc * v)
+        return torch.sqrt((dP * dP).sum(-1) + 1e-8)
+
+    def frame_depths(self, windows):
+        """
+        후보 윈도우 묶음 [M, S, 87] → '프레임별' 최대 선형 관통 깊이(cm) [M, S].
+        라운드당 이 호출 1회로 모든 후보를 평가하는 것이 이 모듈의 속도 핵심이다.
+        """
+        with torch.no_grad():
+            M, S = windows.shape[0], windows.shape[1]
+            local_q = windows[..., 3:].reshape(M, S, self.n_bones, 4)
+            g_rot = torch.zeros(M, S, self.n_bones, 4,
+                                device=windows.device, dtype=windows.dtype)
+            g_pos = torch.zeros(M, S, self.n_bones, 3,
+                                device=windows.device, dtype=windows.dtype)
+            g_rot[:, :, self.hips_i] = local_q[:, :, self.hips_i]
+            g_pos[:, :, self.hips_i] = windows[..., :3]
+
+            # 트리 깊이별로 한 번에: 같은 레벨의 본은 부모가 이미 확정되어 서로 독립이다
+            for child_i, parent_i, offset in self.levels:
+                parent_rot = g_rot[:, :, parent_i]
+                g_rot[:, :, child_i] = self._qmul(parent_rot, local_q[:, :, child_i])
+                g_pos[:, :, child_i] = g_pos[:, :, parent_i] + \
+                    self._qrot(parent_rot, offset.expand(M, S, -1, -1))
+
+            dist = self._capsule_distance(g_pos[:, :, self.p1i], g_pos[:, :, self.q1i],
+                                          g_pos[:, :, self.p2i], g_pos[:, :, self.q2i])
+            return (torch.relu(self.thr - dist) * 100.0).amax(dim=-1)      # [M, S]
+
+    def window_depths(self, windows):
+        """
+        후보 윈도우 묶음 [M, S, 87] → 윈도우별 최대 선형 관통 깊이(cm) [M].
+
+        ⚠️ 이 '윈도우 하나당 스칼라 하나' 요약은 transient(sin-ramp: 애초에 한 봉우리만
+        깊게 뚫는 것이 정의)에만 적합하다. persistent는 구간 '내내' 관통해야 하므로
+        max 하나로는 품질을 판정할 수 없다 — _seg_stats_batched를 쓴다. (2026-08-07)
+        """
+        return self.frame_depths(windows).amax(dim=-1)                     # [M]
 
 
-def _apply_local_delta_multi(window, bone_idx, frames, axis_angles_list):
+# (physics, pairs, device)별 evaluator 캐시.
+#   - 공개 API가 physics 객체를 받는 형태를 유지하기 위한 장치다(호출부 무변경).
+#   - evaluate.py는 파일마다 단일 윈도우 진입점을 호출하므로 캐시가 없으면 306회 재생성된다.
+#   - physics를 약한 참조(weak key)로 잡아 physics가 사라지면 캐시도 함께 사라진다.
+_EVALUATOR_CACHE = weakref.WeakKeyDictionary()
+
+
+def _get_evaluator(physics, pairs, device):
+    """physics가 이미 PenetrationEvaluator면 그대로, DifferentiablePhysics면 캐시에서 꺼낸다."""
+    if isinstance(physics, PenetrationEvaluator):
+        return physics
+    key = (tuple(tuple(map(tuple, p)) for p in pairs), str(device))
+    per_physics = _EVALUATOR_CACHE.setdefault(physics, {})
+    ev = per_physics.get(key)
+    if ev is None:
+        ev = PenetrationEvaluator(physics, pairs, device=device)
+        per_physics[key] = ev
+    return ev
+
+
+def _seg_stats_batched(frame_depths, seg_lo, seg_hi):
     """
-    window [S, 87] '하나'에 대해 (축, 각도열) 후보 K개를 배치 연산 한 번으로 적용 → [K, S, 87].
-    후보별 _apply_local_delta 반복 호출과 원소별 연산이 동일해 결과가 비트 단위로 같다
-    (2026-07-13 A/B 검증). 프로파일 결과 후보 생성이 corrupt_batch 시간의 ~47%였고
-    (배치당 ~370회 × 0.17ms), 그 비용이 텐서 크기가 아니라 호출 횟수에 비례했기 때문에
-    K개 후보(지속형 사다리 12개 등)를 한 번에 만드는 것이 핵심 절감이다.
-    """
-    K = len(axis_angles_list)
-    sl = slice(3 + bone_idx * 4, 3 + bone_idx * 4 + 4)
-    dev, dt = window.device, window.dtype
-
-    out = window.unsqueeze(0).repeat(K, 1, 1)                     # [K, S, 87]
-    ang = torch.tensor([aa[1] for aa in axis_angles_list], dtype=dt, device=dev)  # [K, n]
-    ax = torch.tensor([aa[0] for aa in axis_angles_list], dtype=dt, device=dev)   # [K, 3]
-    half = ang * 0.5
-    deltas = torch.cat([ax.unsqueeze(1) * torch.sin(half).unsqueeze(-1),
-                        torch.cos(half).unsqueeze(-1)], dim=-1)   # [K, n, 4]
-
-    idx = torch.tensor(frames, dtype=torch.long, device=dev)
-    q = out[:, idx, sl]                                           # [K, n, 4]
-    qn = _quat_mul(q, deltas)
-    out[:, idx, sl] = qn / (qn.norm(dim=-1, keepdim=True) + 1e-8)
-    return out
-
-
-def _frame_depths_batched(windows, physics, pairs):
-    """
-    후보 윈도우 묶음 [M, S, 87]의 '프레임별' 최대 선형 관통 깊이(cm) [M, S] 반환.
-    라운드당 FK 1회로 모든 후보를 평가하는 것이 이 모듈의 속도 핵심.
-    """
-    with torch.no_grad():
-        dep = physics.get_penetration_depths_from_quats(
-            windows[..., :3], windows[..., 3:], pairs) * 100.0    # [M, S, n_pairs]
-    return dep.amax(dim=-1)                                       # [M, S]
-
-
-def _depths_batched(windows, physics, pairs):
-    """
-    후보 윈도우 묶음 [M, S, 87]의 윈도우별 최대 선형 관통 깊이(cm) [M] 반환.
-    (주입되지 않은 프레임은 클린 ≈ 무관통이므로 전 프레임 max ≈ 주입 구간 max.)
-
-    ⚠️ 이 '윈도우 하나당 스칼라 하나' 요약은 transient(sin-ramp: 애초에 한 봉우리만
-    깊게 뚫는 것이 정의)에만 적합하다. persistent는 구간 '내내' 관통해야 하므로
-    max 하나로는 품질을 판정할 수 없다 — _seg_stats를 쓴다. (2026-08-07)
-    """
-    return _frame_depths_batched(windows, physics, pairs).amax(dim=-1)   # [M]
-
-
-def _seg_stats(frame_depths, f0, f1):
-    """
-    프레임별 깊이 [S] 에서 주입 구간 [f0, f1] 의 (coverage, 중앙값, 최대값)을 낸다.
+    프레임별 깊이 [M, S]와 후보별 주입 구간 [M], [M] → (coverage [M], 중앙값 [M], 최대 [M]).
       - coverage : 구간 프레임 중 실제로 관통(>0)한 비율. '지속성'의 척도.
       - 중앙값   : 전형적인 프레임의 침투 깊이. 목표 범위(1~4cm) 판정에 쓴다.
     윈도우 max 대신 이 둘을 보는 이유: 같은 각도라도 포즈가 프레임마다 달라 깊이가
     출렁이므로, max만 보면 '한 프레임만 3cm 뚫린' 후보가 채택되어 나머지 프레임이
     무관통으로 남는다 (실측 2026-08-07: 주입 구간 프레임의 62%가 침투 0이었다).
+
+    구판은 후보마다 float()를 3번 불러 동기화했다(배치당 ~6000회). 여기서는 전 후보를
+    한 텐서로 처리하고 호출 측이 .cpu()를 1회만 하도록 만든다 — GPU 경로에서는 이 차이가
+    전체 시간의 77%를 좌우한다(분석 §2-3).
+    중앙값은 torch.median의 규약(짝수 길이 = 아래쪽 중앙값)을 그대로 재현한다.
     """
-    seg = frame_depths[f0:f1 + 1]
-    cov = float((seg > 1e-4).float().mean())
-    return cov, float(seg.median()), float(seg.max())
+    M, S = frame_depths.shape
+    ar = torch.arange(S, device=frame_depths.device).unsqueeze(0)            # [1, S]
+    mask = (ar >= seg_lo.unsqueeze(1)) & (ar <= seg_hi.unsqueeze(1))         # [M, S]
+    n = mask.sum(1)                                                          # [M]
+    cov = (frame_depths > 1e-4).logical_and(mask).sum(1).to(frame_depths.dtype) / n.to(frame_depths.dtype)
+    mx = frame_depths.masked_fill(~mask, float('-inf')).amax(1)
+    srt = frame_depths.masked_fill(~mask, float('inf')).sort(dim=1).values
+    med = srt.gather(1, ((n - 1) // 2).unsqueeze(1)).squeeze(1)
+    return cov, med, mx
+
+
+def _build_candidates(src, specs, S):
+    """
+    후보 명세 목록을 하나의 텐서 [M, S, 87]로 조립한다.
+
+    specs 원소 = (src행 인덱스, 본 인덱스, f0, f1, 축[3], 각도열(라디안, 길이 f1-f0+1)).
+    구판은 '샘플마다' 후보 생성 함수를 불렀고(배치당 ~186회) 그 비용이 텐서 크기가 아니라
+    호출 횟수에 비례했다. 여기서는 라운드 전체의 후보를 한 번에 만든다.
+
+    ⚠️ 인덱스/각도 배열은 반드시 '호스트(numpy)에서 조립한 뒤 한 번에 전송'해야 한다.
+       디바이스 텐서를 원소별로 채우면(ang[m, f0:f1+1] = ...) 전송이 M회 발생해
+       구판보다 느려진다 (실측: 4.9ms → 70ms).
+
+    구간 밖 프레임은 각도 0 → delta = 항등이지만, 정규화까지 건너뛰도록 where로 원본
+    쿼터니언을 그대로 남긴다 (구판이 지정 프레임만 손대던 동작과 비트 단위로 일치).
+    """
+    M = len(specs)
+    dev, dt = src.device, src.dtype
+
+    src_i_h = np.fromiter((s[0] for s in specs), dtype=np.int64, count=M)
+    bone_i_h = np.fromiter((s[1] for s in specs), dtype=np.int64, count=M)
+    f0_h = np.fromiter((s[2] for s in specs), dtype=np.int64, count=M)
+    f1_h = np.fromiter((s[3] for s in specs), dtype=np.int64, count=M)
+    axis_h = np.array([s[4] for s in specs], dtype=np.float32)
+    ang_h = np.zeros((M, S), dtype=np.float32)
+    for m, s in enumerate(specs):
+        ang_h[m, s[2]:s[3] + 1] = s[5]
+
+    src_i = torch.from_numpy(src_i_h).to(dev)
+    bone_i = torch.from_numpy(bone_i_h).to(dev)
+    f0 = torch.from_numpy(f0_h).to(dev)
+    f1 = torch.from_numpy(f1_h).to(dev)
+    axis = torch.from_numpy(axis_h).to(dev, dt)
+    ang = torch.from_numpy(ang_h).to(dev, dt)
+
+    out = src[src_i].clone()                                                 # [M, S, 87]
+    ar = torch.arange(S, device=dev)
+    mask = (ar >= f0.unsqueeze(1)) & (ar <= f1.unsqueeze(1))                 # [M, S]
+
+    half = ang * 0.5
+    delta = torch.cat([axis.unsqueeze(1) * torch.sin(half).unsqueeze(-1),
+                       torch.cos(half).unsqueeze(-1)], dim=-1)               # [M, S, 4]
+
+    quats = out[..., 3:].reshape(M, S, len(BONE_NAMES), 4)
+    idx = bone_i.view(M, 1, 1, 1).expand(M, S, 1, 4)
+    q = quats.gather(2, idx).squeeze(2)                                      # [M, S, 4]
+    qn = _quat_mul(q, delta)
+    qn = qn / (qn.norm(dim=-1, keepdim=True) + 1e-8)
+    qn = torch.where(mask.unsqueeze(-1), qn, q)                              # 구간 밖은 원본 유지
+    out[..., 3:] = quats.scatter(2, idx, qn.unsqueeze(2)).reshape(M, S, len(BONE_NAMES) * 4)
+    return out
 
 
 # ------------------------------------------------------------------
 # 일시적(transient) 주입 — sin-ramp (그룹 단위 배치 처리)
 # ------------------------------------------------------------------
-def _inject_transient_group(windows, physics, cfg, rng, pairs):
+def _inject_transient_group(src, idxs, ev, cfg, rng, S):
     """
-    windows: [S,87] 텐서 리스트 → [(손상 복사본, meta), ...] (입력 순서 유지).
+    src [B,S,87]에서 idxs가 가리키는 샘플들에 일시적 주입 → [(손상 윈도우, meta), ...].
     라운드마다 샘플별로 (타이밍, θ_peak, 본, 축±) 후보 2개를 만들고 배치 FK 1회로 깊이를
     평가한다. 최소 관통(transient_min_depth_cm) 미달이면 재추첨; 전부 실패하면 마지막
     추첨을 그대로 사용한다 (무충돌 섭동도 유효한 복원 샘플 — meta['collided']=False).
     """
-    n = len(windows)
-    S = windows[0].shape[0]
+    n = len(idxs)
+    sub = src[torch.tensor(idxs, device=src.device, dtype=torch.long)]
     results = [None] * n
     last = [None] * n
     pending = list(range(n))
@@ -222,7 +434,7 @@ def _inject_transient_group(windows, physics, cfg, rng, pairs):
     for round_i in range(1, cfg['transient_max_tries'] + 1):
         if not pending:
             break
-        cands, owners, cmetas = [], [], []
+        specs, owners, cmetas = [], [], []
         for j in pending:
             dur = rng.randint(cfg['transient_dur_range'][0], cfg['transient_dur_range'][1])
             start = rng.randint(-(dur // 2), S - 1 - dur // 2)   # 경계 클리핑 허용
@@ -231,30 +443,27 @@ def _inject_transient_group(windows, physics, cfg, rng, pairs):
             axis = _rand_unit_axis(rng)
 
             f0, f1 = max(0, start), min(S - 1, start + dur)
-            frames = list(range(f0, f1 + 1))
             angles = [math.radians(theta_peak) * math.sin(math.pi * (f - start) / dur)
-                      for f in frames]
+                      for f in range(f0, f1 + 1)]
 
             # 축 방향이 몸 바깥쪽일 수 있으므로 ±axis 두 후보를 같은 라운드에 평가
             # (θ 분포 자체는 설계값 U[15°,70°] 유지; 방향만 보정)
-            ax_list = (axis, [-a for a in axis])
-            multi = _apply_local_delta_multi(windows[j], BONE_MAP[bone], frames,
-                                             [(ax, angles) for ax in ax_list])
-            for k, ax in enumerate(ax_list):
-                cands.append(multi[k])
+            for ax in (axis, [-a for a in axis]):
+                specs.append((j, BONE_MAP[bone], f0, f1, ax, angles))
                 owners.append(j)
                 cmetas.append(dict(type='transient', bone=bone, bone_idx=BONE_MAP[bone],
                                    frames=(f0, f1), theta_peak_deg=round(theta_peak, 2),
                                    axis=[round(a, 4) for a in ax], tries=round_i))
 
-        depths = _depths_batched(torch.stack(cands), physics, pairs)
+        cands = _build_candidates(sub, specs, S)
+        depths = ev.window_depths(cands).cpu().tolist()          # 전송 1회
 
         accepted = set()
-        for c_i in range(len(cands)):
+        for c_i in range(len(specs)):
             j = owners[c_i]
             if j in accepted or results[j] is not None:
                 continue
-            meta = dict(cmetas[c_i], max_depth_cm=round(float(depths[c_i]), 3), collided=True)
+            meta = dict(cmetas[c_i], max_depth_cm=round(depths[c_i], 3), collided=True)
             last[j] = (cands[c_i], meta)
             if depths[c_i] >= cfg['transient_min_depth_cm']:
                 results[j] = (cands[c_i], meta)
@@ -270,23 +479,26 @@ def _inject_transient_group(windows, physics, cfg, rng, pairs):
 
 def inject_transient(window, physics, cfg, rng, pairs):
     """단일 윈도우 [S,87] 진입점 (evaluate.py 등에서 사용). 원본은 보존."""
-    return _inject_transient_group([window], physics, cfg, rng, pairs)[0]
+    ev = _get_evaluator(physics, pairs, window.device)
+    return _inject_transient_group(window.unsqueeze(0), [0], ev, cfg, rng, window.shape[0])[0]
 
 
 # ------------------------------------------------------------------
 # 지속적(persistent) 주입 — 깊이 목표(1~4cm) 각도 탐색 (그룹 단위 배치 처리)
 # ------------------------------------------------------------------
-def _inject_persistent_group(windows, physics, cfg, rng, pairs):
+def _inject_persistent_group(src, idxs, ev, cfg, rng, S):
     """
-    windows: [S,87] 텐서 리스트 → [(손상 복사본, meta), ...] (입력 순서 유지).
+    src [B,S,87]에서 idxs가 가리키는 샘플들에 지속 주입 → [(손상 윈도우, meta), ...].
     샘플별로 (본, ±축)을 추첨하고 각도 사다리 전체를 후보로 만들어 배치 FK 1회로 깊이를
     평가한다. 사다리에 목표 범위(1~4cm)가 없으면 범위를 감싸는 두 각도 사이를 이분 보간
     (다음 라운드), 양방향 모두 무침투면 본/축 재추첨. persistent_max_rounds 안에 실패하면
     클린 폴백(meta['fallback']=True) — 호출 측이 카운트해 비율 왜곡을 감시.
     """
-    n = len(windows)
-    S = windows[0].shape[0]
+    n = len(idxs)
+    dev = src.device
+    sub = src[torch.tensor(idxs, device=dev, dtype=torch.long)]
     lo, hi = cfg['persistent_depth_range_cm']
+    mid = (lo + hi) * 0.5
     min_cov = cfg.get('persistent_min_coverage', 0.9)
     ladder = list(cfg['persistent_angle_ladder_deg'])
     results = [None] * n
@@ -304,16 +516,16 @@ def _inject_persistent_group(windows, physics, cfg, rng, pairs):
             seg_info.append((0, S - 1, 'full'))
 
     # pending 상태: refine=None이면 새 (본,축) 추첨 + 사다리, refine=(bone, axis, [각도들])이면 보간 후보만
-    pending = [dict(j=j, refine=None, draws=0) for j in range(n)]
+    pending = [dict(j=j, refine=None) for j in range(n)]
 
     for round_i in range(1, cfg['persistent_max_rounds'] + 1):
         if not pending:
             break
-        cands, owners, cmetas = [], [], []
+        specs, owners, cmetas = [], [], []
         for p in pending:
             j = p['j']
             f0, f1, seg = seg_info[j]
-            frames = list(range(f0, f1 + 1))
+            n_frames = f1 - f0 + 1
             if p['refine'] is not None:
                 draws = [p['refine']]                      # (bone, [축], 각도열)
             else:
@@ -326,29 +538,29 @@ def _inject_persistent_group(windows, physics, cfg, rng, pairs):
                     ax0 = _rand_unit_axis(rng)
                     draws.append((rng.choice(cfg['inject_bones']),
                                   [ax0, [-a for a in ax0]], ladder))
-                p['draws'] += 1
             for bone, axes, angle_list in draws:
                 axes = [axes] if isinstance(axes[0], float) else list(axes)
-                combos = [(ax, theta) for ax in axes for theta in angle_list]
-                multi = _apply_local_delta_multi(
-                    windows[j], BONE_MAP[bone], frames,
-                    [(ax, [math.radians(theta)] * len(frames)) for ax, theta in combos])
-                for k, (ax, theta) in enumerate(combos):
-                    cands.append(multi[k])
-                    owners.append(id(p))
-                    cmetas.append(dict(bone=bone, axis=ax, theta=theta,
-                                       frames=(f0, f1), seg=seg))
+                for ax in axes:
+                    for theta in angle_list:
+                        specs.append((j, BONE_MAP[bone], f0, f1, ax,
+                                      [math.radians(theta)] * n_frames))
+                        owners.append(id(p))
+                        cmetas.append(dict(bone=bone, axis=ax, theta=theta,
+                                           frames=(f0, f1), seg=seg))
 
-        frame_depths = _frame_depths_batched(torch.stack(cands), physics, pairs)  # [M, S]
+        cands = _build_candidates(sub, specs, S)
+        frame_depths = ev.frame_depths(cands)                                  # [M, S]
+        seg_lo = torch.tensor([s[2] for s in specs], device=dev, dtype=torch.long)
+        seg_hi = torch.tensor([s[3] for s in specs], device=dev, dtype=torch.long)
+        cov_t, med_t, mx_t = _seg_stats_batched(frame_depths, seg_lo, seg_hi)
+        stats = torch.stack([cov_t, med_t, mx_t], dim=1).cpu().tolist()        # 전송 1회
 
         # 샘플별 후보 결과 취합. 깊이 판정은 '윈도우 max'가 아니라 주입 구간의
         # (coverage, 중앙값)으로 한다 — 지속형의 정의가 '구간 내내 관통'이기 때문.
         by_p = {id(p): [] for p in pending}
-        for c_i in range(len(cands)):
-            m = cmetas[c_i]
-            f0, f1 = m['frames']
-            cov, med, mx = _seg_stats(frame_depths[c_i], f0, f1)
-            by_p[owners[c_i]].append((c_i, m, cov, med, mx))
+        for c_i in range(len(specs)):
+            cov, med, mx = stats[c_i]
+            by_p[owners[c_i]].append((c_i, cmetas[c_i], cov, med, mx))
 
         still = []
         for p in pending:
@@ -357,7 +569,6 @@ def _inject_persistent_group(windows, physics, cfg, rng, pairs):
             # 1) coverage를 만족하면서 깊이 중앙값이 목표 범위인 후보 → 중앙에 가장 가까운 것
             ok = [e for e in entries if e[2] >= min_cov and lo <= e[3] <= hi]
             if ok:
-                mid = (lo + hi) * 0.5
                 c_i, m, cov, med, mx = min(ok, key=lambda e: abs(e[3] - mid))
                 results[j] = (cands[c_i], dict(type='persistent', bone=m['bone'],
                                                bone_idx=BONE_MAP[m['bone']],
@@ -395,7 +606,6 @@ def _inject_persistent_group(windows, physics, cfg, rng, pairs):
             #   (구판은 폴백 시 손상 샘플이 통째로 클린이 되어 지속형 비율이 조용히 줄었다)
             cov_ok = [e for e in entries if e[2] >= min_cov and e[3] > 0.0]
             if cov_ok:
-                mid = (lo + hi) * 0.5
                 cand = min(cov_ok, key=lambda e: abs(e[3] - mid))
                 prev = p.get('best')
                 if prev is None or abs(cand[3] - mid) < abs(prev[3] - mid):
@@ -423,13 +633,14 @@ def _inject_persistent_group(windows, physics, cfg, rng, pairs):
                 collided=True, out_of_range=True))
         else:
             # coverage를 만족하는 후보가 아예 없었다 → 클린 폴백 (항등 보존 샘플로 학습)
-            results[j] = (windows[j].clone(), dict(type='clean', fallback=True, seg=seg))
+            results[j] = (sub[j].clone(), dict(type='clean', fallback=True, seg=seg))
     return results
 
 
 def inject_persistent(window, physics, cfg, rng, pairs):
     """단일 윈도우 [S,87] 진입점 (evaluate.py 등에서 사용). 원본은 보존."""
-    return _inject_persistent_group([window], physics, cfg, rng, pairs)[0]
+    ev = _get_evaluator(physics, pairs, window.device)
+    return _inject_persistent_group(window.unsqueeze(0), [0], ev, cfg, rng, window.shape[0])[0]
 
 
 # ------------------------------------------------------------------
@@ -441,8 +652,13 @@ def corrupt_batch(clean_batch, physics, cfg, rng, pairs):
     타겟은 항상 원본 clean_batch (호출 측이 그대로 보관).
     혼합비: clean_ratio는 전체 대비, transient_ratio는 '손상 샘플' 중 비율.
       (기본 0.5 / 0.3 → 전체 분포: 클린 50% / 일시적 15% / 지속적 35%)
+
+    physics 인자는 DifferentiablePhysics 또는 PenetrationEvaluator 둘 다 받는다.
+    전자를 넘기면 (physics, pairs, device)별 evaluator를 내부에서 캐시해 재사용한다 —
+    호출부를 바꾸지 않고도 배치 경로를 쓰기 위한 장치다.
     """
-    B = clean_batch.shape[0]
+    B, S = clean_batch.shape[0], clean_batch.shape[1]
+    ev = _get_evaluator(physics, pairs, clean_batch.device)
     out = clean_batch.clone()
     metas = [dict(type='clean') for _ in range(B)]
 
@@ -454,12 +670,12 @@ def corrupt_batch(clean_batch, physics, cfg, rng, pairs):
 
     if tr_idx:
         for i, (w, m) in zip(tr_idx, _inject_transient_group(
-                [clean_batch[i] for i in tr_idx], physics, cfg, rng, pairs)):
+                clean_batch, tr_idx, ev, cfg, rng, S)):
             out[i] = w
             metas[i] = m
     if pe_idx:
         for i, (w, m) in zip(pe_idx, _inject_persistent_group(
-                [clean_batch[i] for i in pe_idx], physics, cfg, rng, pairs)):
+                clean_batch, pe_idx, ev, cfg, rng, S)):
             out[i] = w
             metas[i] = m
     return out, metas
@@ -473,9 +689,12 @@ def corrupted_batches(dataloader, physics, cfg, rng, pairs, prefetch=2):
     DataLoader 배치를 백그라운드 스레드에서 '순차적으로' 손상시켜
     (clean_batch, corrupted_batch, metas)를 내놓는 제너레이터.
 
-    목적: 주입은 CPU 작업(배치당 ~수십 ms)이라 메인 루프에서 직접 호출하면 그 시간 동안
-    GPU가 통째로 논다. 이 제너레이터는 GPU가 배치 N을 학습하는 동안 배치 N+1의 주입을
-    준비해 주입 비용을 GPU 시간 뒤로 숨긴다 (에폭 시간 ≈ max(주입, GPU) + ε).
+    목적: 주입이 CPU에서 도는 동안 GPU가 노는 것을 막는다. GPU가 배치 N을 학습하는 동안
+    배치 N+1의 주입을 준비해 주입 비용을 GPU 시간 뒤로 숨긴다 (에폭 ≈ max(주입, GPU) + ε).
+
+    ⚠️ 주입을 GPU에서 수행하면(윈도우 텐서를 CUDA에 올려 호출) 학습 스텝과 같은 스트림을
+       쓰므로 겹칠 것이 없어 이 프리페치는 이득이 아니라 손해가 된다(실측 1.6배). GPU 경로를
+       택할 때는 이 제너레이터 대신 corrupt_batch를 직접 부를 것.
 
     재현성 보장: 데이터 순회와 rng 소비가 '단일 스레드에서 순차'로 일어나므로,
     메인 루프에서 corrupt_batch를 직접 부르던 기존 방식과 배치 순서·난수 소비 순서·

@@ -4,7 +4,7 @@
 학습(train.py)·평가(evaluate.py)와 동일한 corruption.py 주입기로 held-out 테스트
 파일에 클리핑을 주입하고, train.py 설정(LAMBDA_*/RUN_TAG)과 일치하는 run 폴더의
 체크포인트로 교정한 결과를 demo_results/ 에 저장한다.
-→ 이후 'python AI_model/motion_viz.py compare' 로 시각화.
+→ 이후 'python AI_model/viz_motion.py compare' 로 시각화.
 
 [구판과의 차이 — §4.1 반영]
   - 주입: 구판의 'LeftUpperArm 로컬 +Z 90° 고정' 주입은 §4.1 학습 분포에서
@@ -65,7 +65,7 @@ DEMO_SCENARIOS = {
 DEMO_SEED = random.randrange(0, 4000)           # 파일/주입 추첨 시드 — 바꾸면 다른 데모가 나온다
 DEMO_SEED = int(os.environ.get("DEMO_SEED", DEMO_SEED))   # 재현: DEMO_SEED=1234 로 고정 실행 가능
 # 지정 시 해당 .pt 파일 고정 (재현용), 빈 문자열 = 추첨.
-# 현재 값: inject_viz.py가 seed=1234로 뽑은 파일과 동일 — 주입 시각화 gif와 데모가
+# 현재 값: viz_inject.py가 seed=1234로 뽑은 파일과 동일 — 주입 시각화 gif와 데모가
 # 같은 모션을 쓰도록 맞춘 것이다 (DEMO_SEED=1234와 함께 쓰면 주입 결과까지 일치).
 TARGET_FILE = "" #processed_motions_VMC/dataset-1_call_normal_001.pt
 DEMO_MIN_DEPTH_CM = 2.0        # 화면에서 잘 보이는 최소 주입 깊이 — 두 시나리오 모두에 적용
@@ -217,7 +217,7 @@ def create_demo():
 
     print(f"이 데모 재현: DEMO_SEED={DEMO_SEED} python AI_model/demo_maker.py "
           f"(+ TARGET_FILE='{target_file}' 고정 시 완전 동일)")
-    print("준비 완료! 이제 'python AI_model/motion_viz.py compare' 로 결과를 확인하세요.")
+    print("준비 완료! 이제 'python AI_model/viz_motion.py compare' 로 결과를 확인하세요.")
 
 
 if __name__ == "__main__":

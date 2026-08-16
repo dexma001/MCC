@@ -12,6 +12,7 @@ from scipy.spatial.transform import Rotation as R
 
 # 기존 프로젝트 모듈 로드
 from dataset_pipeline import (PARENTS, BONE_NAMES, BONE_MAP, BONE_RADII, get_split_files,
+                              RADII_MODE, SOFT_TISSUE_KAPPA,
                               make_run_name, find_run_dir_by_config, find_latest_checkpoint_in,
                               list_available_runs)
 # 기본 아키텍처 모델을 '아키텍처 중립' 심볼(MODEL_CLASS)로 로드한다.
@@ -146,10 +147,64 @@ def make_coks_sigmas(scale_m):
     return scale_m * k_radii, scale_m * k_uniform
 
 
-def calculate_coks_terms(gp_out, gp_in, mask, sigma_radii, sigma_uniform):
+# =====================================================================
+# [cOKS σ 정의 2] COCO OKS 공식 σ (2026-08-12 추가) — 기존 radii/uniform과 '병기'한다.
+#   ⚠️ 치환이 아니라 추가다. 기존 두 열을 지우면 과거 실험 행과의 비교 가능성이 파괴된다.
+#
+#   COCO_KP_SIGMAS는 cocoeval.py의 kpt_oks_sigmas 원문 값이며, 그 의미는 '중복 어노테이션
+#   5000장에서 측정한 사람 어노테이터 불일치 표준편차 / 객체 스케일(√area)'이다. 즉 신체
+#   기하가 아니라 **측정 불확실성**이므로, BONE_RADII(캡슐 반지름 = 부피)와는 차원이 다르다.
+#
+#   🚨 GAIN=2.0의 근거: cocoeval.py는 vars=(2σ)², e=d²/vars/area/2 로 계산하므로 실효
+#      가우시안 표준편차는 σ가 아니라 **2σ·√area** 다. 우리 커널 exp(−d²/(2σ_i²))에
+#      원문 σ를 그대로 넣으면 COCO의 절반 허용치가 된다 → k_i = 2σ 로 맞춘다.
+#      GAIN=1.0(원문 값 그대로)도 사전등록 대조군으로 함께 기록한다 (사후 선택 방지).
+#
+#   🚨 스케일 주의: COCO의 정규화 스케일은 √(세그먼트 면적)이고 우리 s는 Hips→Head 체인
+#      (실측 0.4756 m = 골격 전장 1.4622 m의 0.325배)이다. 즉 이식되는 것은 COCO의
+#      '관절 간 상대 가중치'이고, 절대 허용치는 COCO 공칭의 0.65~0.81배(GAIN=2 기준)가
+#      된다. 이 사실은 결과 해석에 반드시 병기한다 — "COCO와 동일한 허용치"가 아니다.
+# =====================================================================
+COCO_KP_SIGMAS = {'nose': 0.026, 'eye': 0.025, 'ear': 0.035, 'shoulder': 0.079,
+                  'elbow': 0.072, 'wrist': 0.062, 'hip': 0.107, 'knee': 0.087, 'ankle': 0.089}
+COCO_SIGMA_GAIN = 2.0
+_HEAD_AVG = (COCO_KP_SIGMAS['nose'] + COCO_KP_SIGMAS['eye'] + COCO_KP_SIGMAS['ear']) / 3.0
+
+# 21개 본 ← COCO 키포인트 대응 (사용자 지정 매핑, 2026-08-12).
+#   COCO에 없는 본(Spine/Chest/Neck/Toes/Shoulder)은 해부학적으로 가장 가까운 키포인트를 쓴다.
+COCO_SIGMAS = {
+    'Hips': COCO_KP_SIGMAS['hip'], 'Spine': COCO_KP_SIGMAS['hip'], 'Chest': COCO_KP_SIGMAS['hip'],
+    'Neck': _HEAD_AVG, 'Head': _HEAD_AVG,                       # nose/eye/ear 평균
+    'LeftShoulder': COCO_KP_SIGMAS['shoulder'], 'RightShoulder': COCO_KP_SIGMAS['shoulder'],
+    'LeftUpperArm': COCO_KP_SIGMAS['elbow'], 'RightUpperArm': COCO_KP_SIGMAS['elbow'],
+    'LeftLowerArm': COCO_KP_SIGMAS['elbow'], 'RightLowerArm': COCO_KP_SIGMAS['elbow'],
+    'LeftHand': COCO_KP_SIGMAS['wrist'], 'RightHand': COCO_KP_SIGMAS['wrist'],
+    'LeftUpperLeg': COCO_KP_SIGMAS['knee'], 'RightUpperLeg': COCO_KP_SIGMAS['knee'],
+    'LeftLowerLeg': COCO_KP_SIGMAS['knee'], 'RightLowerLeg': COCO_KP_SIGMAS['knee'],
+    'LeftFoot': COCO_KP_SIGMAS['ankle'], 'RightFoot': COCO_KP_SIGMAS['ankle'],
+    'LeftToes': COCO_KP_SIGMAS['ankle'], 'RightToes': COCO_KP_SIGMAS['ankle'],
+}
+assert set(COCO_SIGMAS) == set(BONE_NAMES), "COCO_SIGMAS 키가 BONE_NAMES와 다릅니다"
+
+
+def make_coco_sigmas(scale_m):
+    """
+    COCO σ 기반 σ_i(m) 두 벌을 반환: (gain 적용본, 원문 값 그대로).
+      - coco     : σ_i = s · (2 · σ_COCO_i)   ← COCO 커널과 동일한 실효 허용치 정의
+      - coco_raw : σ_i = s · σ_COCO_i         ← 사전등록 대조군 (원문 숫자 그대로)
+    radii/uniform과 달리 여기서는 s가 소거되지 않는다 — s가 실제로 허용치를 정한다.
+    """
+    k = torch.tensor([COCO_SIGMAS[b] for b in BONE_NAMES], dtype=torch.float32)
+    return scale_m * (COCO_SIGMA_GAIN * k), scale_m * k
+
+
+def calculate_coks_terms(gp_out, gp_in, mask, sigmas):
     """
     [부수 변화 — 위치, Tier 2] 기준 포즈를 '클린'이 아니라 **모델 입력(손상 입력)**으로 두는
-    OKS 계열 지표. 반환: (coks_radii, coks_uniform, collateral_pos_cm)
+    OKS 계열 지표. 반환: (dict[σ정의 이름] -> cOKS, collateral_pos_cm)
+
+    sigmas는 {'radii': [J] 텐서, 'uniform': ..., 'coco': ..., 'coco_raw': ...} 형태로,
+    사전등록한 모든 σ 정의를 '동시에' 계산한다 (사후에 유리한 정의를 고르지 못하게 하는 장치).
 
         cOKS = (1/|V|) Σ_{i∈V} exp( −d_i² / (2 σ_i²) ),   d_i = ‖FK(출력)_i − FK(입력)_i‖
 
@@ -167,11 +222,9 @@ def calculate_coks_terms(gp_out, gp_in, mask, sigma_radii, sigma_uniform):
     """
     d = torch.norm(gp_out - gp_in, dim=-1)              # [F, J] (m)
     dm = d[:, mask]                                     # [F, |V|]
-    sr = sigma_radii[mask]
-    su = sigma_uniform[mask]
-    kr = torch.exp(-(dm ** 2) / (2.0 * sr ** 2)).mean().item()
-    ku = torch.exp(-(dm ** 2) / (2.0 * su ** 2)).mean().item()
-    return kr, ku, dm.mean().item() * 100.0
+    scores = {name: torch.exp(-(dm ** 2) / (2.0 * sig[mask] ** 2)).mean().item()
+              for name, sig in sigmas.items()}
+    return scores, dm.mean().item() * 100.0
 
 
 def load_run_config(run_dir):
@@ -221,7 +274,17 @@ def append_results_csv(row, csv_path="evaluate_results.csv"):
               "coks_radii", "coks_uniform", "collateral_pos_cm", "coks_scale_m",
               # [Tier-1 클로즈아웃] pck_frame_*가 전 임계값 0.0%라 프레임 단위 R1 지표가
               #   판별력을 잃은 상태를 복구하기 위한 느슨한 임계값 (게이팅은 기존과 동일).
-              "pck_10cm", "pck_frame_10cm"]
+              "pck_10cm", "pck_frame_10cm",
+              # ---- COCO σ 기반 cOKS (2026-08-12) — '맨 뒤에만' 규칙 유지 ---------------
+              #   coks_coco     : σ_i = s·(2·σ_COCO_i)  ← COCO 커널과 같은 실효 허용치 (주 지표)
+              #   coks_coco_raw : σ_i = s·σ_COCO_i      ← 원문 숫자 그대로 (사전등록 대조군)
+              #   기존 coks_radii/coks_uniform은 그대로 둔다 (과거 행과의 비교 가능성 보존).
+              "coks_coco", "coks_coco_raw",
+              # ---- 캡슐 반지름 시대 (2026-08-12) — '맨 뒤에만' 규칙 유지 ----------------
+              # 🚨 이 두 열이 다른 행끼리는 침투 지표(max_pen*/clean_frames*/depth_removal*)와
+              #    coks_radii/coks_uniform을 **비교하면 안 된다** — 임계값 자체가 다르다.
+              #    빈칸 = 2026-08-12 이전 행(= 구판 손튜닝 표, legacy와 동일).
+              "radii_mode", "radii_kappa"]
     exists = os.path.exists(csv_path)
     if exists:
         with open(csv_path, "r", newline="", encoding="utf-8") as f:
@@ -421,8 +484,14 @@ def evaluate(scenarios=None, limit=0):
     # [cOKS] 골격 스케일 s와 사전등록된 두 σ 정의를 실행 시작 시 1회 계산한다.
     coks_scale = compute_coks_scale(physics_engine)
     sigma_radii, sigma_uniform = make_coks_sigmas(coks_scale)
+    sigma_coco, sigma_coco_raw = make_coco_sigmas(coks_scale)
+    SIGMAS = {"radii": sigma_radii, "uniform": sigma_uniform,
+              "coco": sigma_coco, "coco_raw": sigma_coco_raw}
     print(f"✅ cOKS 스케일 s = {coks_scale:.4f} m (Hips→Head 오프셋 체인, 런타임 계산) | "
           f"σ_uniform = {float(sigma_uniform[0]) * 100:.2f} cm")
+    print(f"   σ_coco (gain {COCO_SIGMA_GAIN:g}) = "
+          f"{float(sigma_coco[BONE_MAP['Head']]) * 100:.2f} cm (Head) ~ "
+          f"{float(sigma_coco[BONE_MAP['Hips']]) * 100:.2f} cm (Hips)")
 
     # 🚨 학습에 쓰지 않은 held-out 파일만 평가 대상으로 사용
     test_files = [f for f in get_split_files(motions_dir, split='test')]
@@ -442,12 +511,12 @@ def evaluate(scenarios=None, limit=0):
     for scenario in scenarios:
         _eval_one_scenario(scenario, model, physics_engine, ALL_PAIRS, test_files,
                            lam_recon, lam_phys, run_epochs, run_tag,
-                           coks_scale, sigma_radii, sigma_uniform)
+                           coks_scale, SIGMAS)
 
 
 def _eval_one_scenario(scenario, model, physics_engine, ALL_PAIRS, test_files,
                        lam_recon, lam_phys, run_epochs, run_tag,
-                       coks_scale, sigma_radii, sigma_uniform):
+                       coks_scale, sigmas):
     corrupt = scenario != "clean"
 
     # ---- 테스트셋 전체 순회하며 파일별 지표 수집 --------------------
@@ -457,7 +526,8 @@ def _eval_one_scenario(scenario, model, physics_engine, ALL_PAIRS, test_files,
     # [cOKS] 부수 변화(위치 공간) — 본 지표 / 사전등록 대조군 / 비포화 동반 지표.
     #   3DPCK와 정반대로 '전 시나리오' 계산한다: 기준이 손상 입력이라 역상관 함정이
     #   구조적으로 없기 때문이다. clean에서는 gp_input==gp_clean이므로 do-no-harm 수치가 된다.
-    coks_r_list, coks_u_list, collat_list = [], [], []
+    coks_lists = {name: [] for name in sigmas}    # σ 정의별 파일 단위 cOKS 누적
+    collat_list = []
     mask_size_hist = {}             # |V| 분포 (자손 마스킹 누락을 직접 잡는 검증용)
     jit_before, jit_after = [], []
     bonelen_after = []
@@ -599,10 +669,9 @@ def _eval_one_scenario(scenario, model, physics_engine, ALL_PAIRS, test_files,
             #   자손을 빼지 않으면 정당한 교정이 부수 변화로 오계상되어 지표 부호가 뒤집힌다).
             cmask = get_collateral_mask(meta)
             mask_size_hist[int(cmask.sum())] = mask_size_hist.get(int(cmask.sum()), 0) + 1
-            _kr, _ku, _cp = calculate_coks_terms(gp_corr, gp_input, cmask,
-                                                 sigma_radii, sigma_uniform)
-            coks_r_list.append(_kr)
-            coks_u_list.append(_ku)
+            _scores, _cp = calculate_coks_terms(gp_corr, gp_input, cmask, sigmas)
+            for _n, _v in _scores.items():
+                coks_lists[_n].append(_v)
             collat_list.append(_cp)
 
             # (4) Jitter(참고 지표): 부드러움
@@ -634,8 +703,8 @@ def _eval_one_scenario(scenario, model, physics_engine, ALL_PAIRS, test_files,
     bl_m, _ = ms(bonelen_after)
     intent_m = float(np.mean(intent_list)) if intent_list else None
     intent_dyn_m = float(np.mean(intent_dyn_list)) if intent_dyn_list else None
-    coks_r_m = float(np.mean(coks_r_list)) if coks_r_list else None
-    coks_u_m = float(np.mean(coks_u_list)) if coks_u_list else None
+    coks_m = {n: (float(np.mean(v)) if v else None) for n, v in coks_lists.items()}
+    coks_r_m, coks_u_m = coks_m["radii"], coks_m["uniform"]
     collat_m = float(np.mean(collat_list)) if collat_list else None
 
     # [항목 1] 추론 시간 집계 — 워밍업 구간 제외 후 평균/p95.
@@ -769,14 +838,19 @@ def _eval_one_scenario(scenario, model, physics_engine, ALL_PAIRS, test_files,
     if coks_r_m is not None:
         vs = "/".join(f"{v}×{n}" for v, n in sorted(mask_size_hist.items()))
         crole = "do-no-harm(포즈 변경량)" if scenario == "clean" else "부수 변화"
-        print(f"  ▶ cOKS (기준=손상 입력)   : radii {coks_r_m:.4f} / uniform {coks_u_m:.4f}"
+        print(f"  ▶ cOKS (기준=손상 입력)   : COCO {coks_m['coco']:.4f}"
               f"   ({crole}, [0,1] 높을수록 좋음)")
+        print(f"     - σ 정의별 : coco {coks_m['coco']:.4f} / coco_raw {coks_m['coco_raw']:.4f}"
+              f" / radii {coks_r_m:.4f} / uniform {coks_u_m:.4f}")
         print(f"     - 비포화 동반 지표 collateral_pos_cm : {collat_m:.3f} cm  (낮을수록 좋음)")
         print(f"     - 마스크 |V| 분포 : {vs}  (주입 본 + FK 자손 제외 / s = {coks_scale:.4f} m)")
         print("    ↳ 기준 포즈를 '클린'이 아니라 '모델 입력'으로 두어, persistent/legacy80에서")
         print("       MPJPE·3DPCK가 겪는 역상관(되돌릴수록 점수↑)을 구조적으로 회피한다.")
-        print("       uniform은 사전등록 대조군(σ=3.52cm 균등)이다 — 두 값을 항상 나란히 읽어")
+        print("       uniform은 사전등록 대조군(σ=3.52cm 균등)이다 — 값들을 항상 나란히 읽어")
         print("       관절별 가중이 결과를 만든 것인지 검증한다. σ 사후 재조정 금지.")
+        print("       ⚠️ COCO σ는 '어노테이터 불일치'이고 radii는 '캡슐 반지름'이다 (차원이 다름).")
+        print("          또 s가 √area가 아니라 몸통 길이라 절대 허용치는 COCO 공칭의 0.65~0.81배 —")
+        print("          이식된 것은 '관절 간 상대 가중치'이지 COCO와 동일한 허용치가 아니다.")
         print("       ⚠️ exp 커널은 d≫σ에서 0에 포화한다. 포화가 의심되면 반드시")
         print("          collateral_pos_cm(비포화, cm)을 판단 근거로 쓸 것.")
     print(f"  ▶ Jitter(참고 지표)        : Before {jb_m:.4f} / After {ja_m:.4f} cm/frame²")
@@ -849,6 +923,12 @@ def _eval_one_scenario(scenario, model, physics_engine, ALL_PAIRS, test_files,
         # [Tier-1 클로즈아웃] 느슨한 PCK 임계값 (게이팅은 기존 pck_*와 동일 → 그 외 빈칸)
         "pck_10cm": round(pck_joint[10.0], 2) if pck_joint else "",
         "pck_frame_10cm": round(pck_frame[10.0], 2) if pck_frame else "",
+        # [COCO σ] 주 지표(coco) + 사전등록 대조군(coco_raw). 기존 열은 병기 유지.
+        "coks_coco": round(coks_m["coco"], 4) if coks_m["coco"] is not None else "",
+        "coks_coco_raw": round(coks_m["coco_raw"], 4) if coks_m["coco_raw"] is not None else "",
+        # 이 행이 어느 캡슐 반지름 표로 산출됐는지 (없으면 과거 행 = 구판 손튜닝 표)
+        "radii_mode": RADII_MODE,
+        "radii_kappa": SOFT_TISSUE_KAPPA,
     }
     csv_path = append_results_csv(row)
     print(f"📝 시나리오 '{scenario}' 집계 지표가 '{csv_path}'에 기록되었습니다 "

@@ -21,7 +21,7 @@ CSV → .pt 전처리 전용 스크립트 (구 dataset_pipeline.py의 MODE='PREP
   부수 효과: 이 스크립트는 matplotlib/scipy를 전혀 로드하지 않는다.
 
 ⚠️ 좌표 규약: 여기서 저장하는 텐서는 원본 CSV와 같은 Unity(Y-Up) 규약이다.
-   학습/물리(FK)는 이 규약을 그대로 쓰고, 시각화만 motion_viz.py에서 Z-Up으로 변환한다.
+   학습/물리(FK)는 이 규약을 그대로 쓰고, 시각화만 viz_motion.py에서 Z-Up으로 변환한다.
    즉 이 파일은 좌표 변환을 하지 않는다 — 하면 전 파이프라인이 어긋난다.
 """
 import argparse
