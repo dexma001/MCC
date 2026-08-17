@@ -37,7 +37,7 @@ BONE_MAP = {name: i for i, name in enumerate(BONE_NAMES)}
 # ============================================================
 # 캡슐 반지름 (BONE_RADII) — 2026-08-12 해부학 기반으로 재설계
 # ============================================================
-# ⚠️ 먼저 알아야 할 규약: 캡슐은 `PARENTS[b] -> b` 선분이고 임계값은
+#     먼저 알아야 할 규약: 캡슐은 `PARENTS[b] -> b` 선분이고 임계값은
 #    `BONE_RADII[c1] + BONE_RADII[c2]` 이다 (physics_module.get_collision_loss).
 #    따라서 **BONE_RADII[X]는 'X 뼈'의 두께가 아니라 '부모→X 세그먼트'의 두께**다.
 #      'LeftHand'      -> 전완(LowerArm→Hand, 22.3cm)
@@ -81,7 +81,7 @@ SOFT_TISSUE_KAPPA = 0.575      # 연부조직 여유 계수 (클린 데이터로
 # 캡슐이 '실제로 지나가는 조직'의 등면적 원 단면 반지름 [m] @ REF_STATURE_M.
 # 출처: Winter, Biomechanics and Motor Control of Human Movement (2009) Table 4.1 (세그먼트
 #      길이비) / ANSUR II·NASA-STD-3000 (둘레·폭·깊이). 타원 단면은 sqrt(반폭×반깊이)로 환산.
-# ⚠️ 뼈 이름이 아니라 '세그먼트가 통과하는 부위'로 매핑했다 (위 규약 참조).
+#      뼈 이름이 아니라 '세그먼트가 통과하는 부위'로 매핑했다 (위 규약 참조).
 ANATOMICAL_RADIUS_AT_REF = {
     'Hips':      0.1356,  # 루트(임계값 미사용). 하복부와 동일값 — cOKS σ 용도
     'Spine':     0.1356,  # Hips→Spine   = 하복부: 허리 폭0.320·깊이0.230 → sqrt(.160×.115)

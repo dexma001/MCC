@@ -34,8 +34,8 @@ LEARNING_RATE = 1e-4
 #   (KL을 실제로 쓰는 PVTVAE 실험을 재현하려면 PVTVAE_baseline/train.py 를 사용한다.)
 # =====================================================================
 LAMBDA_RECON = 1.0   # 복구 타겟(클린 정답) 충실도 가중치 (anchor, 고정 권장)
-LAMBDA_PHYS  = 0.5   # 충돌 제거(collision) 목표 가중치 — 스윕 그리드를 바꿔가며 실험
-BETA_KL      = 0.0   # ⚠️ 손실 아님 — run 폴더 이름/평가 코드 호환용 상수 (0.0 고정)
+LAMBDA_PHYS  = 0.3   # 충돌 제거(collision) 목표 가중치 — 스윕 그리드를 바꿔가며 실험
+BETA_KL      = 0.0   # [주의] 손실 아님 — run 폴더 이름/평가 코드 호환용 상수 (0.0 고정)
 
 # =====================================================================
 # [§4.1 지도학습 디클리핑] — 근본 원인 보고서(collision_after_root_cause_report.md)의 처방.
@@ -50,8 +50,8 @@ BETA_KL      = 0.0   # ⚠️ 손실 아님 — run 폴더 이름/평가 코드 
 #   비율은 유형별 평가 행(evaluate.py 시나리오)으로 검증 후 조정한다 — 하드코딩 금지.
 # =====================================================================
 DECLIP_MODE = True                            # False = 구(舊) 클린→클린 정규화 학습 (비교/재현용)
-RUN_TAG_BASE = "tfm_declip_cov_l10.1"         # 'tfm' 접두어 → PVTVAE run 폴더와 절대 충돌 안 함
-# ⚠️ 캡슐 반지름 시대 구분자를 '자동으로' 덧붙인다 (2026-08-12 해부학 반지름 도입).
+RUN_TAG_BASE = "tfm_declip_cov_MSEOnly_1.1"         # 'tfm' 접두어 → PVTVAE run 폴더와 절대 충돌 안 함
+# [주의] 캡슐 반지름 시대 구분자를 '자동으로' 덧붙인다 (2026-08-12 해부학 반지름 도입).
 #    반지름이 바뀌면 물리 손실 임계값·주입 깊이 목표·전 지표가 함께 바뀌므로, 태그를 손으로
 #    붙이는 것을 잊으면 같은 λ의 구시대 폴더에서 resume해 실험이 조용히 오염된다.
 #    RADII_TAG = "_anat"(신판) / ""(legacy) → dataset_pipeline.RADII_MODE 하나만 바꾸면 된다.
@@ -119,7 +119,7 @@ def train():
     start_epoch = 1
 
     # 재개는 '같은 가중치' 폴더 안에서만 한다 (다른 lambda는 자기 폴더에서 새로 시작).
-    # ⚠️ 체크포인트 파일명은 반드시 'pvtvae_epoch_*.pth' 를 유지한다 — 공유 헬퍼
+    # [주의] 체크포인트 파일명은 반드시 'pvtvae_epoch_*.pth' 를 유지한다 — 공유 헬퍼
     #    (find_latest_checkpoint_in / find_run_dir_by_config / list_available_runs)가
     #    이 패턴으로 글롭하므로, 다른 이름으로 저장하면 evaluate/inference/demo_maker가
     #    가중치를 찾지 못하고 재개 파싱(split('_')[2])도 깨진다.
@@ -188,7 +188,7 @@ def train():
             ramp = min(1.0, (epoch - PHYS_WARMUP_EPOCHS) / max(1, PHYS_RAMP_EPOCHS))
             lambda_phys = LAMBDA_PHYS * ramp
 
-        # 🚨 §4.1 핵심: 모델 '입력'에만 클리핑을 주입한다 (타겟은 클린 원본 유지).
+        # [주의] §4.1 핵심: 모델 '입력'에만 클리핑을 주입한다 (타겟은 클린 원본 유지).
         #    일시적 주입 → 시간 문맥 기반 복원 학습 / 지속적(작은 깊이) → 최소 사영 학습 /
         #    클린 절반 → "손상이 없으면 건드리지 마라" (항등 보존, R2 앵커).
         # 주입은 CPU 작업(배치당 ~수십 ms)이라 메인 루프에서 직접 부르면 그동안 GPU가 논다 →
@@ -226,7 +226,7 @@ def train():
             loss_recon_quat = nn.MSELoss()(recon_quats, target_quats)
             loss_sparsity = nn.L1Loss()(recon_quats, target_quats)
 
-            loss_recon = loss_recon_quat + loss_sparsity * 0.1
+            loss_recon = loss_recon_quat *1.1 # + loss_sparsity * 0.1
 
             # 물리 엔진 연동: FK로 관절 월드 좌표 복원 → 충돌 Loss
             loss_phys = torch.tensor(0.0, device=DEVICE)
@@ -238,7 +238,7 @@ def train():
             loss = (LAMBDA_RECON * loss_recon) + (lambda_phys * loss_phys)
             loss.backward()
 
-            # 💥 안전벨트: 기울기(Gradient)가 폭발하지 않도록 최대치 제한
+            # 안전벨트: 기울기(Gradient)가 폭발하지 않도록 최대치 제한
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
             optimizer.step()

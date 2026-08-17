@@ -56,7 +56,7 @@ DEMO_SCENARIO = 'persistent'    # 'transient'(글리치 복원) 또는 'persiste
 
 # 시나리오별 (주입 함수, 채택 깊이 하한). evaluate.py의 시나리오 중 이 둘만 데모가 지원한다
 # ('clean'은 보여줄 충돌이 없고, 'legacy80'은 §4.1 학습 분포에서 의도적으로 제외된 계열).
-# ⚠️ persistent 하한은 주입기의 목표 범위 상한(persistent_depth_range_cm[1]=4.0cm)을
+# [주의] persistent 하한은 주입기의 목표 범위 상한(persistent_depth_range_cm[1]=4.0cm)을
 #    넘길 수 없다 — 넘기면 어떤 후보도 채택되지 못해 영구 실패한다. 아래에서 clamp한다.
 DEMO_SCENARIOS = {
     'transient':  corruption.inject_transient,
@@ -67,7 +67,7 @@ DEMO_SEED = int(os.environ.get("DEMO_SEED", DEMO_SEED))   # 재현: DEMO_SEED=12
 # 지정 시 해당 .pt 파일 고정 (재현용), 빈 문자열 = 추첨.
 # 현재 값: viz_inject.py가 seed=1234로 뽑은 파일과 동일 — 주입 시각화 gif와 데모가
 # 같은 모션을 쓰도록 맞춘 것이다 (DEMO_SEED=1234와 함께 쓰면 주입 결과까지 일치).
-TARGET_FILE = "" #processed_motions_VMC/dataset-1_call_normal_001.pt
+TARGET_FILE = "" # processed_motions_VMC/dataset-1_call_normal_001.pt
 DEMO_MIN_DEPTH_CM = 2.0        # 화면에서 잘 보이는 최소 주입 깊이 — 두 시나리오 모두에 적용
 MAX_FILE_TRIES = 30            # 재추첨 상한 (초과 시 그때까지 최선의 후보 사용)
 
@@ -150,7 +150,7 @@ def create_demo():
         rng = random.Random(DEMO_SEED + 10007 * try_i)
         corrupted, meta = inject_fn(clean, physics, DEMO_CFG, rng, COLLIDING_PAIRS)
         depth = meta.get('max_depth_cm', 0.0)
-        # ⚠️ meta['collided']는 '충돌했는가'가 아니라 '주입기 내부 임계를 통과했는가'다
+        # [주의] meta['collided']는 '충돌했는가'가 아니라 '주입기 내부 임계를 통과했는가'다
         #    (corruption.py:224 / 342). transient는 임계 미달이면 실제로 관통했어도
         #    collided=False가 되므로, 차선 후보 추적은 collided가 아니라 depth로 한다.
         #    이 구분이 없으면 아래 best 폴백이 영원히 도달 불가능한 죽은 코드가 되고,

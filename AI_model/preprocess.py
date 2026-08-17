@@ -7,10 +7,10 @@ CSV → .pt 전처리 전용 스크립트 (구 dataset_pipeline.py의 MODE='PREP
 실행:
     python AI_model/preprocess.py                 # 없는 .pt만 새로 만든다 (기존은 건너뜀)
     python AI_model/preprocess.py --dry-run       # 계획만 출력, 아무것도 쓰지 않음
-    python AI_model/preprocess.py --overwrite     # ⚠️ 기존 .pt를 전부 다시 만든다
+    python AI_model/preprocess.py --overwrite     # [주의] 기존 .pt를 전부 다시 만든다
     python AI_model/preprocess.py --out-dir other_dir
 
-⚠️ 기존 `processed_motions_VMC/`의 .pt는 학습·평가의 기준 데이터다. 기본 실행은 이미 있는
+[주의] 기존 `processed_motions_VMC/`의 .pt는 학습·평가의 기준 데이터다. 기본 실행은 이미 있는
    파일을 건드리지 않으며, 재생성은 `--overwrite`를 명시할 때만 일어난다.
    (2026-08-08 이전 판은 인자를 무시해서 `--help`만 쳐도 전체 전처리가 실행됐다.)
 
@@ -20,7 +20,7 @@ CSV → .pt 전처리 전용 스크립트 (구 dataset_pipeline.py의 MODE='PREP
   전처리와 시각화는 실행 시점·의존성·목적이 전부 다르므로 파일을 분리한다.
   부수 효과: 이 스크립트는 matplotlib/scipy를 전혀 로드하지 않는다.
 
-⚠️ 좌표 규약: 여기서 저장하는 텐서는 원본 CSV와 같은 Unity(Y-Up) 규약이다.
+[주의] 좌표 규약: 여기서 저장하는 텐서는 원본 CSV와 같은 Unity(Y-Up) 규약이다.
    학습/물리(FK)는 이 규약을 그대로 쓰고, 시각화만 viz_motion.py에서 Z-Up으로 변환한다.
    즉 이 파일은 좌표 변환을 하지 않는다 — 하면 전 파이프라인이 어긋난다.
 """
@@ -77,7 +77,7 @@ def run_preprocess(raw_csv_dir=RAW_CSV_DIR, out_dir=PROCESSED_PT_DIR,
     """
     raw_csv_dir의 모든 CSV를 [Frames, 87] 텐서로 변환해 out_dir에 저장.
 
-    ⚠️ 기본값은 '보수적'이다 — out_dir에 이미 있는 .pt는 건너뛴다.
+    [주의] 기본값은 '보수적'이다 — out_dir에 이미 있는 .pt는 건너뛴다.
        기존 산출물은 학습·평가의 기준 데이터이므로, 덮어쓰려면 overwrite=True를
        명시해야 한다 (CLI: --overwrite). dry_run=True면 아무것도 쓰지 않고 계획만 출력.
 
@@ -129,7 +129,7 @@ def main(argv=None):
     """
     CLI 진입점.
 
-    ⚠️ 이 함수가 존재하는 이유(2026-08-08): 구판은 `__main__`에서 곧바로
+    [주의] 이 함수가 존재하는 이유(2026-08-08): 구판은 `__main__`에서 곧바로
     run_preprocess()를 호출해 **어떤 인자를 줘도 전처리가 실행됐다.**
     실제로 `--help`를 친 것만으로 3077개 파일 전처리가 시작된 사고가 있었다.
     이제 인자를 해석하고, 기존 산출물은 --overwrite 없이는 건드리지 않는다.

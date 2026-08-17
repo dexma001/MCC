@@ -49,7 +49,7 @@ def inference():
     # ==========================================
     # 4. 테스트 데이터 로드 및 전처리
     # ==========================================
-    # 🚨 과적합 방지: 학습에 쓰지 않은 held-out(test) 파일에서만 샘플을 고른다.
+    # [주의] 과적합 방지: 학습에 쓰지 않은 held-out(test) 파일에서만 샘플을 고른다.
     pt_files = get_split_files(motions_dir, split='test')
     if not pt_files:
         raise FileNotFoundError(f" '{motions_dir}' 폴더에 held-out(test) .pt 파일이 없습니다.")

@@ -21,6 +21,9 @@ from dataset_pipeline import (PARENTS, BONE_NAMES, BONE_MAP, BONE_RADII, get_spl
 from models import TransformerDenoiserCompat as MODEL_CLASS
 from physics_module import DifferentiablePhysics
 import corruption
+# [R1.5-3] 사영 레이어. projection.PROJ_ENABLED=False면 호출조차 하지 않으므로
+#   기존 50열 지표는 도입 전과 수치까지 동일하다 (회귀 게이트의 근거).
+import projection
 # 평가 대상 실험은 train.py에 설정된 손실 가중치 + run 태그로 선택한다 (mtime이 아니라 설정 기반).
 # → train.py에서 LAMBDA_*/DECLIP_MODE를 과거 실험 값으로 바꾸면 그 실험을 다시 평가할 수 있다.
 from train import LAMBDA_RECON, LAMBDA_PHYS, BETA_KL, RUN_TAG, COLLIDING_PAIRS as MONITORED_PAIRS
@@ -55,17 +58,17 @@ EVAL_CORRUPTION_CFG = corruption.make_cfg()   # 주입 '형태' 파라미터는 
 #   필드 표준 150mm는 우리 스케일에서 무의미하다(MPJPE가 이미 4~6cm라 전부 100%로 포화).
 #   1/2/5cm는 max_pen과 '같은 축(cm)'이라 침투 깊이와 나란히 읽힌다. 발명 상수 0개.
 #
-# 🚨 시나리오 게이팅 (설계상 필수): PCK는 '클린 정답'을 기준으로 하므로 거리에 단조인 지표다.
+# [주의] 시나리오 게이팅 (설계상 필수): PCK는 '클린 정답'을 기준으로 하므로 거리에 단조인 지표다.
 #   따라서 persistent/legacy80(지속형 심층 손상)에서는 "의도적 포즈를 원래대로 되돌릴수록
 #   점수가 오르는" 역상관이 발생한다 — 제품 목표는 복원이 아니라 '최소 사영'이기 때문이다.
 #   이는 지금 헤드라인에서 강등하는 persistent MPJPE와 정확히 같은 함정이므로,
 #   PCK는 아래 두 시나리오에서만 계산하고 나머지는 CSV에 빈칸으로 남긴다.
 # =====================================================================
 #
-# 📌 10cm 추가 (2026-08-02, Tier-1 클로즈아웃): 5cm까지의 pck_frame_*가 전 임계값에서
+# 10cm 추가 (2026-08-02, Tier-1 클로즈아웃): 5cm까지의 pck_frame_*가 전 임계값에서
 #   0.0%로 나와 '프레임 단위 R1 지표'가 판별력을 완전히 잃었다. 버그가 아니라 오차 분포가
 #   이봉형(≈1/3이 <1cm, ≈1/3이 >5cm — FK 사슬 누적으로 말단이 지배)이라는 사실의 귀결이다.
-#   느슨한 임계값 하나를 더해 판별력을 복구한다. ⚠️ 10cm에서도 0.0%로 나온다면 그것 또한
+#   느슨한 임계값 하나를 더해 판별력을 복구한다. [주의] 10cm에서도 0.0%로 나온다면 그것 또한
 #   '정직한 결과'로 그대로 보고한다 (임계값을 값이 나올 때까지 조정하지 않는다).
 PCK_THRESHOLDS_CM = (1.0, 2.0, 5.0, 10.0)
 PCK_SCENARIOS = ("clean", "transient")
@@ -76,7 +79,7 @@ TIMING_WARMUP_FILES = 5
 # =====================================================================
 # [Tier 2 / cOKS] FK 자손 집합 — 부수변화 마스크의 핵심.
 #
-# 🚨 왜 '주입 본 1개'로는 부족한가:
+# [주의] 왜 '주입 본 1개'로는 부족한가:
 #   intent_mae는 로컬 쿼터니언 공간에서 동작하므로 주입 본만 빼면 충분했다 (자손의 로컬
 #   회전은 주입에 영향받지 않는다). cOKS는 FK '위치' 공간에서 동작하므로 사정이 완전히 다르다.
 #   physics_module.forward_kinematics가
@@ -122,7 +125,7 @@ def get_collateral_mask(meta):
 
 def compute_coks_scale(physics_engine):
     """
-    cOKS의 골격 스케일 s (m) = Hips→Head 오프셋 체인 길이. ⚠️ 하드코딩 금지 —
+    cOKS의 골격 스케일 s (m) = Hips→Head 오프셋 체인 길이. [주의] 하드코딩 금지 —
     physics_engine.bone_offsets에서 런타임 계산한다. 다른 아바타로 옮길 때 s만 다시 재면
     k_i 테이블은 그대로 두고 허용오차가 체격에 비례해 자동 스케일된다.
     """
@@ -149,18 +152,18 @@ def make_coks_sigmas(scale_m):
 
 # =====================================================================
 # [cOKS σ 정의 2] COCO OKS 공식 σ (2026-08-12 추가) — 기존 radii/uniform과 '병기'한다.
-#   ⚠️ 치환이 아니라 추가다. 기존 두 열을 지우면 과거 실험 행과의 비교 가능성이 파괴된다.
+#   [주의] 치환이 아니라 추가다. 기존 두 열을 지우면 과거 실험 행과의 비교 가능성이 파괴된다.
 #
 #   COCO_KP_SIGMAS는 cocoeval.py의 kpt_oks_sigmas 원문 값이며, 그 의미는 '중복 어노테이션
 #   5000장에서 측정한 사람 어노테이터 불일치 표준편차 / 객체 스케일(√area)'이다. 즉 신체
 #   기하가 아니라 **측정 불확실성**이므로, BONE_RADII(캡슐 반지름 = 부피)와는 차원이 다르다.
 #
-#   🚨 GAIN=2.0의 근거: cocoeval.py는 vars=(2σ)², e=d²/vars/area/2 로 계산하므로 실효
+#   [주의] GAIN=2.0의 근거: cocoeval.py는 vars=(2σ)², e=d²/vars/area/2 로 계산하므로 실효
 #      가우시안 표준편차는 σ가 아니라 **2σ·√area** 다. 우리 커널 exp(−d²/(2σ_i²))에
 #      원문 σ를 그대로 넣으면 COCO의 절반 허용치가 된다 → k_i = 2σ 로 맞춘다.
 #      GAIN=1.0(원문 값 그대로)도 사전등록 대조군으로 함께 기록한다 (사후 선택 방지).
 #
-#   🚨 스케일 주의: COCO의 정규화 스케일은 √(세그먼트 면적)이고 우리 s는 Hips→Head 체인
+#   [주의] 스케일 주의: COCO의 정규화 스케일은 √(세그먼트 면적)이고 우리 s는 Hips→Head 체인
 #      (실측 0.4756 m = 골격 전장 1.4622 m의 0.325배)이다. 즉 이식되는 것은 COCO의
 #      '관절 간 상대 가중치'이고, 절대 허용치는 COCO 공칭의 0.65~0.81배(GAIN=2 기준)가
 #      된다. 이 사실은 결과 해석에 반드시 병기한다 — "COCO와 동일한 허용치"가 아니다.
@@ -216,7 +219,7 @@ def calculate_coks_terms(gp_out, gp_in, mask, sigmas):
     "이미 크게 건드린 관절"을 더 세밀히 등급 나눌 실익이 없다 (5cm 밀림과 15cm 밀림은 둘 다
     과잉 보정 실패다). 즉 exp 커널의 부호는 '기준 포즈'에 따라 뒤집힌다.
 
-    ⚠️ 그래도 σ(2~3.5cm)에 비해 관측 오차가 크면 전부 0에 몰려 판별력을 잃을 수 있으므로
+    [주의] 그래도 σ(2~3.5cm)에 비해 관측 오차가 크면 전부 0에 몰려 판별력을 잃을 수 있으므로
        (pck_frame_*가 전부 0.0%가 된 것과 같은 실패 양식) 비포화 동반 지표
        collateral_pos_cm(마스크 적용 평균 거리, cm)을 반드시 함께 읽는다.
     """
@@ -254,7 +257,7 @@ def append_results_csv(row, csv_path="evaluate_results.csv"):
               "jitter_before_mean", "jitter_after_mean",
               "bonelen_after_cm_mean",
               # ---- Tier 1 신규 컬럼 (2026-07-28) ----------------------------------
-              # 🚨 스키마 규칙: 신규 컬럼은 '반드시 맨 뒤에만' 추가한다. 절대 중간 삽입 금지.
+              # [주의] 스키마 규칙: 신규 컬럼은 '반드시 맨 뒤에만' 추가한다. 절대 중간 삽입 금지.
               #    evaluate_visualize.xlsx가 CSV의 '컬럼 위치'를 직접 참조해 만들어졌기 때문에,
               #    중간에 끼워 넣으면 기존 추출 범위가 전부 어긋난다. 맨 뒤 추가면 기존 1~24열
               #    인덱스가 보존되어 기존 시각화가 무수정으로 동작한다. (Tier 2 이후에도 동일 규칙)
@@ -267,7 +270,7 @@ def append_results_csv(row, csv_path="evaluate_results.csv"):
               "pck_frame_1cm", "pck_frame_2cm", "pck_frame_5cm",
               # [항목 3] 동역학 보존 (전 시나리오 기록 — clean에서는 do-no-harm 수치가 된다)
               "intent_dyn_cm",
-              # [항목 1] 추론 시간 (R4) — ⚠️ 배포 지연시간이 아니라 '상한 프록시'
+              # [항목 1] 추론 시간 (R4) — [주의] 배포 지연시간이 아니라 '상한 프록시'
               "infer_ms_window_mean", "infer_ms_window_p95", "infer_ms_per_frame", "infer_device",
               # ---- Tier 2 신규 컬럼 (2026-08-02) — 위와 동일한 '맨 뒤에만' 규칙 적용 -------
               # [cOKS] 부수 변화(위치 공간). 기준 포즈 = 손상 입력. 전 시나리오 기록.
@@ -281,10 +284,18 @@ def append_results_csv(row, csv_path="evaluate_results.csv"):
               #   기존 coks_radii/coks_uniform은 그대로 둔다 (과거 행과의 비교 가능성 보존).
               "coks_coco", "coks_coco_raw",
               # ---- 캡슐 반지름 시대 (2026-08-12) — '맨 뒤에만' 규칙 유지 ----------------
-              # 🚨 이 두 열이 다른 행끼리는 침투 지표(max_pen*/clean_frames*/depth_removal*)와
+              # [주의] 이 두 열이 다른 행끼리는 침투 지표(max_pen*/clean_frames*/depth_removal*)와
               #    coks_radii/coks_uniform을 **비교하면 안 된다** — 임계값 자체가 다르다.
               #    빈칸 = 2026-08-12 이전 행(= 구판 손튜닝 표, legacy와 동일).
-              "radii_mode", "radii_kappa"]
+              "radii_mode", "radii_kappa",
+              # ---- 사영 레이어 (2026-08-17, R1.5-3) — '맨 뒤에만' 규칙 유지 ------------
+              # [주의] proj_mode="off" 행과 "infer" 행은 서로 다른 파이프라인의 결과다.
+              #    비교할 때 반드시 이 열로 구분할 것 (radii_mode와 같은 성격의 시대 구분자).
+              #    proj_residual_max_cm 은 max_pen4_after_cm 과 일치해야 한다 (교차검증용:
+              #    사영 내부 계산과 평가 본체의 독립적인 두 경로가 같은 수를 내는지 본다).
+              "proj_mode", "proj_k", "proj_omega", "proj_margin_cm", "proj_pairs",
+              "proj_ms_window_mean", "proj_ms_per_frame", "proj_frames_pct",
+              "proj_residual_max_cm", "proj_move_cm"]
     exists = os.path.exists(csv_path)
     if exists:
         with open(csv_path, "r", newline="", encoding="utf-8") as f:
@@ -358,14 +369,14 @@ def calculate_intent_mae(motion_out, motion_in, injected_bone_idx):
     기존 지표(클린 대비 근접도)만으로는 "팔을 홱 잡아떼고도 좋은 점수"인 과잉 보정을
     구조적으로 볼 수 없어서 추가된 지표 (R2).
 
-    ⚠️ 이름 주의 (2026-07-28 재정의): 이것은 '의도(intent)' 지표가 아니라 '부수 변화' 지표다.
+    [주의] 이름 주의 (2026-07-28 재정의): 이것은 '의도(intent)' 지표가 아니라 '부수 변화' 지표다.
        측정하는 것은 "주입되지 않은 관절이 얼마나 덩달아 움직였는가"이며, 의도의 의미론이
        아니다. 한계: (1) 정당한 협응 교정(어깨와 함께 움직여야 하는 경우)도 벌점 처리한다,
        (2) injected_bone_idx 라벨은 '우리가 주입했기 때문에' 아는 값이라 실제 배포
        스트림에서는 계산할 수 없다, (3) 동역학/타이밍 정보가 없다.
        (2)(3)을 보완하는 것이 calculate_intent_dyn 이다.
 
-    📌 CSV 컬럼명은 'intent_mae_deg' 그대로 유지한다 — append_results_csv의 마이그레이션이
+    CSV 컬럼명은 'intent_mae_deg' 그대로 유지한다 — append_results_csv의 마이그레이션이
        키 기반 복사(r.get(k, ""))라서 컬럼명을 바꾸면 기존 행들의 값이 조용히 소실된다.
        따라서 개명은 '표시 라벨과 문서'에서만 수행한다.
     """
@@ -402,7 +413,7 @@ def calculate_intent_dyn(gp_out, gp_in):
       - 크기 차(‖Δ²(out)‖−‖Δ²(in)‖)가 아니라 벡터 차인 이유: 크기만 보면 방향이 달라져도
         0이 될 수 있다. 벡터 차여야 타이밍/위상 변화를 잡는다.
 
-    ⚠️ 한계 (단독 사용 금지): 정적 의미 오류에 맹목이다. 정지 제스처가 다른 정지 제스처로
+    [주의] 한계 (단독 사용 금지): 정적 의미 오류에 맹목이다. 정지 제스처가 다른 정지 제스처로
        뒤바뀌어도 양쪽 모두 Δ²=0이라 이 지표는 0을 보고한다. 반드시 정적 포즈/의미 항과
        병용해야 한다 (짝이 될 cOKS는 Tier 2). 또한 transient 주입은 그 자체에 가속도 서명이
        있으므로, 그 시나리오에서 이 값은 '글리치 제거분'과 '퍼포먼스 왜곡분'이 섞여 있다.
@@ -493,7 +504,7 @@ def evaluate(scenarios=None, limit=0):
           f"{float(sigma_coco[BONE_MAP['Head']]) * 100:.2f} cm (Head) ~ "
           f"{float(sigma_coco[BONE_MAP['Hips']]) * 100:.2f} cm (Hips)")
 
-    # 🚨 학습에 쓰지 않은 held-out 파일만 평가 대상으로 사용
+    # [주의] 학습에 쓰지 않은 held-out 파일만 평가 대상으로 사용
     test_files = [f for f in get_split_files(motions_dir, split='test')]
     if not test_files:
         print("❌ held-out(test) 파일이 없습니다.")
@@ -548,7 +559,7 @@ def _eval_one_scenario(scenario, model, physics_engine, ALL_PAIRS, test_files,
     # [항목 4] 학습이 '실제로' 최적화하는 4쌍(MONITORED_PAIRS = train.COLLIDING_PAIRS) 한정 누적기.
     #   역할 분리: 4쌍 = 학습 충실도(de-clip 성능) / 112쌍 = 전신 do-no-harm(부작용 감시).
     #   지금까지 한 숫자가 두 역할을 겸해 생긴 해석 혼동을 지표 분리로 해소한다 (§8-A).
-    #   ⚠️ 기존 112쌍 지표는 그대로 병기한다 — 치환하면 과거 44행과 비교 가능성이 파괴된다.
+    #   [주의] 기존 112쌍 지표는 그대로 병기한다 — 치환하면 과거 44행과 비교 가능성이 파괴된다.
     n_coll4_before = 0
     n_coll4_after = 0
     depth4_sum_before = 0.0
@@ -563,6 +574,12 @@ def _eval_one_scenario(scenario, model, physics_engine, ALL_PAIRS, test_files,
     # [항목 1] 추론 시간 측정 (R4). 모델 forward '만' 잰다 — FK/충돌 계산은 평가 전용이라 제외.
     #   앞 TIMING_WARMUP_FILES개는 CUDA 컨텍스트 초기화/커널 캐싱 때문에 통계에서 버린다.
     win_ms = []
+    # [R1.5-3] 사영 레이어 계측기 — 모델 forward 시간(win_ms)과 '분리해서' 잰다.
+    #   기존 infer_ms_* 3열의 의미를 바꾸면 과거 56행과 비교할 수 없게 된다.
+    proj_ms, proj_touched, proj_total, proj_moves = [], 0, 0, []
+    proj_residual_max = 0.0     # 사영이 '스스로' 보고한 잔존 최대 관통(cm).
+    #   [주의] max_pen4_after_cm 을 복사해 넣으면 교차검증이 무의미해진다 — 이 값은 projection.py가
+    #      독립적으로 계산한 것이어야 하고, 두 수가 일치하는지가 곧 검증이다.
     n_joint_total = 0                                    # 총 (프레임 × 관절) 수
     pck_joint_hit = {t: 0 for t in PCK_THRESHOLDS_CM}    # 관절 단위 통과 수
     pck_frame_hit = {t: 0 for t in PCK_THRESHOLDS_CM}    # 프레임 '전원 통과' 수 (R1의 이벤트 형태)
@@ -590,6 +607,20 @@ def _eval_one_scenario(scenario, model, physics_engine, ALL_PAIRS, test_files,
                 torch.cuda.synchronize()
             win_ms.append((time.perf_counter() - _t0) * 1000.0)
             corr = recon.squeeze(0).cpu()                   # [30, 87] 모델 교정 결과
+
+            # [주의] 파이프라인 순서: 모델 → (저역통과 필터 자리 — R1.5-4, 아직 없음) → 사영.
+            #    필터를 사영 '뒤'에 두면 저역통과가 사영 결과를 뭉개 관통을 되살린다
+            #    (실측: persistent max_pen4 0.138 → 4.939cm). 필터가 생기면 바로 이 줄 위에 넣는다.
+            if projection.PROJ_ENABLED:
+                q_proj, pstats = projection.project_window(
+                    physics_engine, corr[:, :3], corr[:, 3:], MONITORED_PAIRS)
+                corr = torch.cat([corr[:, :3], q_proj], dim=1)
+                proj_ms.append(pstats["ms"])
+                proj_touched += pstats["frames_touched"]
+                proj_total += pstats["frames_total"]
+                proj_residual_max = max(proj_residual_max, pstats["residual_max_cm"])
+                if pstats["frames_touched"]:
+                    proj_moves.append(pstats["move_cm"])
 
             # FK로 관절 월드 좌표 복원 [30, 21, 3]
             gp_clean = physics_engine.compute_global_pos_tensor(clean[:, :3], clean[:, 3:])
@@ -619,7 +650,7 @@ def _eval_one_scenario(scenario, model, physics_engine, ALL_PAIRS, test_files,
             pair_max_after = torch.maximum(pair_max_after, dep_c.max(dim=0).values)
 
             # (1-c) [항목 4] 동일한 집계를 '학습 대상 4쌍'에만 적용 (헤드라인 de-clip 지표).
-            #   ⚠️ 4쌍은 112쌍의 부분집합이 아니다 (2026-07-28 실측 확인):
+            #   [주의] 4쌍은 112쌍의 부분집합이 아니다 (2026-07-28 실측 확인):
             #      get_all_eval_pairs()는 캡슐을 (PARENTS[b], b)로만 만드는데 PARENTS['Chest']='Spine'
             #      이므로, 손으로 정의한 긴 몸통 캡슐 (Hips→Chest)은 112쌍에 등장할 수 없다.
             #      즉 4쌍 중 2쌍(몸통↔좌/우 하박)은 112쌍이 '구조적으로 볼 수 없는' 충돌이다.
@@ -717,6 +748,16 @@ def _eval_one_scenario(scenario, model, physics_engine, ALL_PAIRS, test_files,
         infer_ms_frame = infer_ms_mean / SEQ_LEN
     else:
         infer_ms_mean = infer_ms_p95 = infer_ms_frame = None
+
+    # [R1.5-3] 사영 비용/작동량 집계. 워밍업 규약은 모델 계측과 동일하게 맞춘다.
+    if proj_ms:
+        ptimed = proj_ms[TIMING_WARMUP_FILES:] if len(proj_ms) > TIMING_WARMUP_FILES else proj_ms
+        proj_ms_mean = float(np.mean(ptimed))
+        proj_ms_frame = proj_ms_mean / SEQ_LEN
+        proj_frames_pct = 100.0 * proj_touched / max(proj_total, 1)
+        proj_move_mean = float(np.mean(proj_moves)) if proj_moves else 0.0
+    else:
+        proj_ms_mean = proj_ms_frame = proj_frames_pct = proj_move_mean = None
 
     # 선형 침투 지표 집계
     clean_before_pct = 100.0 * (1.0 - n_coll_frames_before / max(n_frames_total, 1))
@@ -864,6 +905,21 @@ def _eval_one_scenario(scenario, model, physics_engine, ALL_PAIRS, test_files,
         print("    ↳ ⚠️ 이 값은 '배포 지연시간'이 아니라 상한 프록시(하한 비용)다. 아직 causal 모드,")
         print("       출력 스무딩 필터, 60↔30fps 리샘플 어댑터가 구현되지 않았고, 30프레임 윈도우를")
         print("       한 번에 처리하는 구조라 실서비스에는 ~1초의 look-ahead 지연이 별도로 존재한다.")
+
+    # ── [5] 사영 레이어 (R1.5-3). PROJ_ENABLED=False면 이 블록 자체가 출력되지 않는다. ──
+    if proj_ms_mean is not None:
+        total_ms_frame = (infer_ms_frame or 0.0) + proj_ms_frame
+        print(f"\n[5] 사영 레이어 — K={projection.PROJ_K}, ω={projection.PROJ_OMEGA}, "
+              f"margin={projection.PROJ_MARGIN_CM}cm, pairs={projection.PROJ_PAIRS}")
+        print(f"  ▶ 손댄 프레임          : {proj_frames_pct:.2f} %  "
+              f"(0%면 사영이 개입할 관통이 없었다는 뜻 = 항등)")
+        print(f"  ▶ 사영 후 잔존 관통    : {proj_residual_max:.3f} cm  "
+              f"(사영 자체 계산값 — max_pen4_after_cm와 일치해야 한다)")
+        print(f"  ▶ 유발한 관절 이동     : {proj_move_mean:.4f} cm (손댄 파일 평균)")
+        print(f"  ▶ 비용                 : {proj_ms_mean:.2f} ms/윈도우 = "
+              f"{proj_ms_frame:.4f} ms/frame")
+        print(f"    ↳ 모델+사영 합계 {total_ms_frame:.4f} ms/frame "
+              f"(사전등록 예산 1.0 ms/frame {'통과' if total_ms_frame <= 1.0 else '초과 ⚠️'})")
     print("=" * 60)
 
     # ---- 실험 기록: 시나리오별 집계 지표를 CSV 한 줄로 저장 ----------
@@ -908,7 +964,7 @@ def _eval_one_scenario(scenario, model, physics_engine, ALL_PAIRS, test_files,
         "pck_frame_5cm": round(pck_frame[5.0], 2) if pck_frame else "",
         # [항목 3] 동역학 보존 (전 시나리오)
         "intent_dyn_cm": round(intent_dyn_m, 4) if intent_dyn_m is not None else "",
-        # [항목 1] 추론 시간 (R4). ⚠️ 상한 프록시 — causal/필터/리샘플 미포함, look-ahead 별도.
+        # [항목 1] 추론 시간 (R4). [주의] 상한 프록시 — causal/필터/리샘플 미포함, look-ahead 별도.
         "infer_ms_window_mean": round(infer_ms_mean, 3) if infer_ms_mean is not None else "",
         "infer_ms_window_p95": round(infer_ms_p95, 3) if infer_ms_p95 is not None else "",
         "infer_ms_per_frame": round(infer_ms_frame, 4) if infer_ms_frame is not None else "",
@@ -929,6 +985,18 @@ def _eval_one_scenario(scenario, model, physics_engine, ALL_PAIRS, test_files,
         # 이 행이 어느 캡슐 반지름 표로 산출됐는지 (없으면 과거 행 = 구판 손튜닝 표)
         "radii_mode": RADII_MODE,
         "radii_kappa": SOFT_TISSUE_KAPPA,
+        # [R1.5-3 사영 레이어] OFF일 때도 proj_mode="off"를 남겨 '사영 없는 행'임을 명시한다
+        #   (빈칸으로 두면 2026-08-17 이전의 과거 행과 구분되지 않는다).
+        "proj_mode": "infer" if projection.PROJ_ENABLED else "off",
+        "proj_k": projection.PROJ_K if projection.PROJ_ENABLED else "",
+        "proj_omega": projection.PROJ_OMEGA if projection.PROJ_ENABLED else "",
+        "proj_margin_cm": projection.PROJ_MARGIN_CM if projection.PROJ_ENABLED else "",
+        "proj_pairs": projection.PROJ_PAIRS if projection.PROJ_ENABLED else "",
+        "proj_ms_window_mean": round(proj_ms_mean, 3) if proj_ms_mean is not None else "",
+        "proj_ms_per_frame": round(proj_ms_frame, 4) if proj_ms_frame is not None else "",
+        "proj_frames_pct": round(proj_frames_pct, 2) if proj_frames_pct is not None else "",
+        "proj_residual_max_cm": round(proj_residual_max, 3) if projection.PROJ_ENABLED else "",
+        "proj_move_cm": round(proj_move_mean, 4) if proj_move_mean is not None else "",
     }
     csv_path = append_results_csv(row)
     print(f"📝 시나리오 '{scenario}' 집계 지표가 '{csv_path}'에 기록되었습니다 "
