@@ -2,95 +2,94 @@
 
 2026 Capsone Project
 
-> **프로젝트명 이력**: 이 프로젝트는 **PVTVAE → MCC**로 개명되었다.
-> 다만 코드·문서에 남아 있는 `PVTVAE`는 대부분 **프로젝트명이 아니라 초기 VAE 아키텍처**를
-> 가리키는 기술 용어이므로 그대로 둔다 (예: "PVTVAE 대비 바뀐 것", `PVTVAE_baseline/`).
-> 마찬가지로 체크포인트 파일명 `pvtvae_epoch_*.pth`는 **내부 구현 규약**이라 개명하지 않는다
-> — 디스크의 기존 가중치 100개 및 `dataset_pipeline.py`의 탐색 헬퍼와 맞물려 있다.
+모션캡처(VMC) 결과에서 몸을 관통하는 **자기충돌(self-collision)을 제거**하되, 원래 동작의
+의도(motion intent)는 보존하는 후처리 모델.
+입출력 단위는 30프레임 윈도우의 87차원 텐서 = Hips 위치(3) + 21관절 로컬 쿼터니언(84).
+
+> 코드에 남아 있는 `PVTVAE`는 프로젝트명이 아니라 **초기 VAE 아키텍처**를 가리키는 기술 용어다
+> (`PVTVAE_baseline/`, 체크포인트 파일명 `pvtvae_epoch_*.pth` = 내부 구현 규약).
 
 ## 1. File Structure
 
-#### AI_model: main folder  
-- dataset_pipeline: 데이터 계약 상수 + 학습 Dataset + train/test 분할 + 체크포인트 헬퍼
-    + 전 모듈이 import하는 코어. matplotlib/scipy/pandas를 로드하지 않는다.
-- preprocess: Sample_Data(.csv) 파일을 .pt로 변환 (`python AI_model/preprocess.py`)
-- viz_motion: 3D 시각화 — 실행 방법 2가지
-    + **소스 설정 + VS Code 실행**: 파일 상단 '소스 설정' 블록의 `VIEW_MODE`
-      (`"single"`/`"compare"`)와 관련 값을 편집한 뒤 그냥 Run(Ctrl+F5).
-      인자를 주지 않으면 이 설정이 쓰인다. F5로는 `.vscode/launch.json`의
-      모드별 구성(COMPARE / SINGLE / gif 저장 / inference_results)을 골라 실행.
-    + **명령줄 인자**(소스 설정보다 우선, 일회성):
-      `python AI_model/viz_motion.py single [파일]` /
-      `python AI_model/viz_motion.py compare [--results DIR] [--save out.gif]`
-- viz_inject: 손상 주입(클리핑)이 어떻게 들어가는지 gif로 시각화
-    + `python AI_model/viz_inject.py both` — transient/persistent gif 모두 생성
-      (`demo_results/injection_*.gif`). `--seed` 고정 시 같은 gif가 재현된다.
-    + 학습과 동일한 `corruption.py` 주입기를 호출하므로 실제 학습 입력 그대로다.
-    + 화면: Clean(주입 대상 본 초록) / Injected(침투 깊이=빨강 강도) / 프레임별 깊이 그래프
-      → transient=봉우리 하나, persistent=구간 내내 고원. 유형 차이가 그래프로 드러난다.
-- physics_module: Define Loss Function (with Lumelsky's Algorithm)
-- models: TransformerDenoiser (기본 아키텍처, 결정론적 — VAE 아님)
-    + 원본 PVTVAE(VAE 포함)는 PVTVAE_baseline/ 으로 분리 보존됨
-- train: Training Function
-- inference:  
+### AI_model: main folder
+- **dataset_pipeline**: 데이터 계약 + 학습 Dataset + 실행 경로 헬퍼 (전 모듈 공용 코어)
+    + 뼈대 계약 상수: `PARENTS` / `BONE_NAMES` / `BONE_MAP` / `BONE_RADII`(캡슐 반지름)
+    + `BandaiMotionDataset`, 결정론적 train/test 분할(`get_split_files`), 체크포인트 탐색 헬퍼
+    + `RADII_MODE`(legacy / anatomical)로 캡슐 반지름 체계를 고르면 run 태그가 따라 붙는다
+    + matplotlib / scipy / pandas를 로드하지 않는다 (무거운 의존성 금지)
+- **preprocess**: Sample_Data(.csv) 파일을 .pt로 변환 — `python AI_model/preprocess.py`
+- **corruption**: 손상(클리핑) 주입기. train(학습 입력)과 evaluate(평가 시나리오)가 공유한다
+    + `transient`: sin-ramp 회전 (θ_peak 15~70°, 5~20프레임) — 센서 글리치 의미론
+    + `persistent`: 상수 오프셋. 각도가 아니라 **관통 깊이 1~4cm**를 목표로 각도를 탐색한다
+- **physics_module**: Define Loss Function (with Lumelsky's Algorithm)
+    + FK(`forward_kinematics`)로 관절 월드 좌표 복원 + 캡슐-캡슐 거리 기반 충돌 손실
+- **projection**: 미분가능 사영 레이어 — 네트워크 출력 뒤에서 관통을 기하학적으로 밀어낸다
+    + 선형화 제약 사영(PBD 계열)을 반복해 `collision <= eps`를 강제한다
+    + 손잡이: `PROJ_ENABLED` / `PROJ_K=8` / `PROJ_OMEGA=1.8` / `PROJ_MARGIN_CM=0.2` / `PROJ_PAIRS`
+    + 위반 프레임이 없으면 즉시 종료 → 클린 입력에 대해 항등
+- **models**: TransformerDenoiser (기본 아키텍처, 결정론적 — VAE 아님)
+    + residual delta 예측 + 관절별 쿼터니언 재정규화, Hips 위치는 통과
+    + `TransformerDenoiserCompat`: 평가·추론 진입점이 쓰는 아키텍처 중립 래퍼
+- **train**: Training Function
+    + 입력에만 손상을 주입하고 손실은 **클린 원본**과 계산한다 (`DECLIP_MODE`)
+      → 혼합비 clean 50 / transient 15 / persistent 35
+    + 손실 = `LAMBDA_RECON`·recon(MSE) + `lambda_phys`·collision, λ_phys는 에폭 커리큘럼
+    + 실험 손잡이: `LAMBDA_PHYS`, `RUN_TAG_BASE`, `EPOCHS=100`, `BATCH_SIZE=32`, `lr=1e-4`
+    + 감시 페어 `COLLIDING_PAIRS` 4개: 몸통-좌팔 / 몸통-우팔 / 좌팔-우팔 / 좌다리-우다리
+    + 체크포인트는 run 설정별 폴더에 저장된다
+- **inference**:
     + Input_0: 가지고 있는 Sample Data(maybe Clean)
-    + Output: Model(Input_0)
-- demo_maker: 
+    + Output: Model(Input_0) — 단발 산출용, CSV에 기록하지 않는다
+- **demo_maker**:
     + Input_1: 가지고 있는 Random Sample Data(maybe Clean) + Artifical Collision
     + Output: Model(Input_1)
-- evaluate: 평가지표:
-    + Physical Plausibility
-        * Collision Depth: 보정된 결과의 Collision (loss)
-        * Bone Length Jitter: 보정 과정의 관절 위치 변화가 미친 영향
-    +  Kinematic Accuracy
-        * MPJPE: Motion 보존 평균 오차
-  
-- 3D_Collision_tot: Collision 발생 시각화
-- test_physics: Testing physics_module
+- **evaluate**: 시나리오별로 테스트셋을 평가해 `evaluate_results.csv`에 1행씩 기록
+    + 시나리오: `clean`(항등 보존) / `legacy80`(LeftUpperArm +80°, 학습 분포 외 심층 손상) /
+      `transient` / `persistent` — 평가 시드 고정으로 같은 손상이 재현된다
+    + 평가할 실험은 train.py의 λ·run 태그 설정으로 고른다
+    + Physical Plausibility: 충돌 손실, max/mean 관통 깊이(전체 및 감시 4페어), 깊이 제거율,
+      무충돌 프레임 비율, bone length, jitter
+    + Kinematic Accuracy: MPJPE, MAE(deg), 3DPCK 1/2/5/10cm(관절별·프레임별),
+      cOKS(radii / uniform / COCO σ)
+    + Motion Intent: `intent_dyn`(Δ² 동역학), `intent_mae_deg`
+    + 성능: 윈도우 추론 시간 mean/p95, 프레임당 시간, device
+    + 실행: `python evaluate.py [--corrupt | --scenarios clean,transient] [--limit N]`
 
-#### PVTVAE_baseline: 원본 PVTVAE(VAE) 재현용 위성 폴더
-- 데이터 계약/물리/손상 주입/평가 스위트는 AI_model/ 을 그대로 import해 재사용하고,
-  아키텍처(model.py)만 다르다. run 폴더 태그로 구분되어 결과가 서로 덮어쓰지 않는다.
+### 루트
+- **preprocess_motion.py**: 원본 .csv 정규화 (Unity 왼손 / Y-up / 쿼터니언).
+  훼손 파일을 걸러내고, Hips 회전으로 up-axis를 판별해 보정한다
+- **requirements.txt**: Python 3.11.9 / torch 2.2.2+cu121 등 고정 버전
+- **evaluate_results.csv**: evaluate.py가 누적 기록하는 실험 로그
+  (신규 컬럼은 맨 뒤에만 추가 — xlsx가 컬럼 위치를 참조한다)
+- **evaluate_visualize.xlsx**: 위 CSV를 정리·시각화한 사본
+- **checkpoints/log.txt**: 학습 로그
+- **.gitignore** / **README**
 
-## *Under this line, there is no classification folder*
+### 로컬 전용 (원격 저장소에서 제외)
+`.gitignore`에 등재되어 있다. clone만으로는 아래 도구가 실행되지 않는다.
+- **AI_model/viz_motion.py**: 3D 모션 시각화 (`single` / `compare`)
+    + 소스 상단 '소스 설정' 블록(`VIEW_MODE` 등)을 편집해 Run, 또는
+      `python AI_model/viz_motion.py single [파일]` /
+      `compare [--results DIR] [--save out.gif]` (인자가 소스 설정보다 우선)
+    + 캡슐과 자기충돌 판정을 함께 표시한다
+- **AI_model/viz_inject.py**: 손상 주입을 시각화 — Clean / Injected(침투 깊이=빨강 강도) /
+  프레임별 깊이 그래프. 학습과 동일한 `corruption.py`를 호출한다
+- **AI_model/viz_radii.py**: 캡슐 반지름(`BONE_RADII`) 점검·보정 도구
+- **AI_model/3D_Collision_tot.py**: Collision 발생 시각화
+- **AI_model/test_physics.py**: Testing physics_module
+- **PVTVAE_baseline/**: 원본 PVTVAE(VAE) 재현용 위성 폴더. 데이터 계약·물리·손상 주입·평가
+  스위트는 `AI_model/`을 import해 재사용하고 아키텍처(model.py)만 다르다
+- 데이터·산출물: `Sample_Data/`, `*.pt`(processed_motions_VMC), `checkpoints/*.pth`, `*_results/`
 
-.gitignore
-  
-README
-  
-
-## 2. Workflow  
+## 2. Workflow
 #### 현재 진행중인 모든 학습의 원본 데이터는 https://github.com/BandaiNamcoResearchInc/Bandai-Namco-Research-Motiondataset 에 있음.
 
 Sample_Data: Bandai_Dataset_csv_modi_tot 사용
 - .csv 추출 과정: .bvh -> Blender (->.fbx) -> Unity(.csv)
 
-## Done
-+ 원본 데이터를 .csv로 가공 (Unity 좌표계에 맞는 왼손, Y up, Quarternion)
-+ .csv -> .pt (for Machine Learning)
-+ PVTVAE 구조 설계 (초기 아키텍처 — 현재 기본은 TransformerDenoiser)
-+ 100 Epochs 학습 (처음 20 Epochs는 KL만, 이후 PL(0~0.1 for 20 epochs))  
-  
-- 2026.07.06
-    + 원본 데이터 정규화 (preprocess_motion.py / processed_motions_VMC)
-    + AI_model/* 수정
-    + jitter_loss 삭제 ()
-    + epoch 100 / 200으로 lambda_phys 값 수정하여 결과 확인
-
-- 2026.07.25
-    + 학습 과정에 의도적 Collision 추가
-        * clean: collision이 없는 깨끗한 Data
-        * transient: 팔이나 다리가 의도적으로 15~70도 안으로 굽게 됨(센서 오류 등을 의도)
-        * persistent: Capsule 거리가 1~4cm인 지속적 collision
-            + clean : collision = 5 : 5
-            + collision -> transient : persistent = 3: 7
-    + 평가 과정에 clean / transient / persistent + legacy80
-        * legacy80: leftupperarm이 80도 안으로 (학습 과정에 없었던 collision)
-    + Model: PVT+VAE -> TFM (PVE+VAE Model은 local에 저장)
-        * TFM이 PVT+VAE에 비해 평균적인 성능이 더 좋았음
-        * 현재 가장 Best Model: TFM 1/0.3
-    + 학습 / 평가 시드 동일
-
-    + 현재 평가 지표 개선 중 
-        * 이 중, "Motion Intent Preservation" 부분에 대한 개선 필요.
-    
+실행 순서:
+1. `python preprocess_motion.py` — 원본 .csv 정규화 (좌표계 / up-axis 보정)
+2. `python AI_model/preprocess.py` — .csv → .pt
+3. `python AI_model/train.py` — λ·run 태그 설정 후 학습
+4. `python AI_model/evaluate.py` — 시나리오별 평가 → `evaluate_results.csv`
+5. `python AI_model/inference.py` / `demo_maker.py` — 단발 결과 산출
