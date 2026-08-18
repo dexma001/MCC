@@ -6,9 +6,6 @@ checkpoints
 # Data with Pytorch Module
 *.pt
 
-# 반지름 보정 도구의 거리 캐시 (14MB, --rebuild로 언제든 재생성)
-claude_analysis/_clean_capsule_dists.npz
-
 # txt
 demo_results/*.txt
 
@@ -17,12 +14,9 @@ Sample_Data
 
 # Next assignment
 Watch_in_Program
-
 euler_to_quart_advanced_indi_raw.py
 
-# GitHub에서는 제외하되 로컬에서는 계속 쓰는 파일 (2026-08-17)
-#   원격 저장소에서 직접 삭제했고, 로컬 작업에는 그대로 필요하다.
-#   여기 등재해 두어야 향후 add/pull 때 다시 추적되거나 디스크에서 지워지지 않는다.
+# Local
 AI_model/3D_Collision_tot.py
 AI_model/test_physics.py
 AI_model/viz_motion.py
