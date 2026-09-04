@@ -22,4 +22,4 @@ AI_model/test_physics.py
 AI_model/viz_motion.py
 AI_model/viz_inject.py
 AI_model/viz_radii.py
-
+__pycache__

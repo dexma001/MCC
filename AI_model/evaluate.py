@@ -24,6 +24,9 @@ import corruption
 # [R1.5-3] 사영 레이어. projection.PROJ_ENABLED=False면 호출조차 하지 않으므로
 #   기존 50열 지표는 도입 전과 수치까지 동일하다 (회귀 게이트의 근거).
 import projection
+# [R1.5-4] 저역통과 필터. lowpass.LP_ENABLED=False면 호출조차 하지 않으므로 기존 60열
+#   지표는 도입 전과 수치까지 동일하다 (사영과 같은 회귀 게이트 논리).
+import lowpass
 # 평가 대상 실험은 train.py에 설정된 손실 가중치 + run 태그로 선택한다 (mtime이 아니라 설정 기반).
 # → train.py에서 LAMBDA_*/DECLIP_MODE를 과거 실험 값으로 바꾸면 그 실험을 다시 평가할 수 있다.
 from train import LAMBDA_RECON, LAMBDA_PHYS, BETA_KL, RUN_TAG, COLLIDING_PAIRS as MONITORED_PAIRS
@@ -295,7 +298,16 @@ def append_results_csv(row, csv_path="evaluate_results.csv"):
               #    사영 내부 계산과 평가 본체의 독립적인 두 경로가 같은 수를 내는지 본다).
               "proj_mode", "proj_k", "proj_omega", "proj_margin_cm", "proj_pairs",
               "proj_ms_window_mean", "proj_ms_per_frame", "proj_frames_pct",
-              "proj_residual_max_cm", "proj_move_cm"]
+              "proj_residual_max_cm", "proj_move_cm",
+              # ---- 저역통과 필터 (2026-08-26, R1.5-4) — '맨 뒤에만' 규칙 유지 ----------
+              # [주의] lp_mode="off" 행과 필터가 켜진 행은 서로 다른 파이프라인의 결과다
+              #    (proj_mode와 같은 성격의 구성 구분자).
+              # [주의] jitter_before_mean/jitter_after_mean의 정의는 바꾸지 않는다 — 과거
+              #    행과의 비교 가능성이 걸려 있다. jitter_p95_after는 그 옆에 새로 붙는
+              #    '프레임별 최악관절 가속도의 p95'이며, 필터 유무와 무관하게 항상 기록한다
+              #    (평균만 보면 국소 팝을 놓친다: 사영 단독 측정에서 평균 +1.8%인데
+              #     p99가 +13.3%였던 사례가 이 열의 근거다).
+              "lp_mode", "lp_window", "lp_beta", "lp_ms_per_frame", "jitter_p95_after"]
     exists = os.path.exists(csv_path)
     if exists:
         with open(csv_path, "r", newline="", encoding="utf-8") as f:
@@ -392,6 +404,19 @@ def calculate_acceleration_jitter(global_pos):
         return 0.0
     accel = global_pos[2:] - 2 * global_pos[1:-1] + global_pos[:-2]
     return torch.norm(accel, dim=-1).mean().item() * 100.0
+
+
+def calculate_frame_jitter_max(global_pos):
+    """프레임별 '최악 관절' 가속도 크기 [F-2] (cm/frame^2).
+
+    calculate_acceleration_jitter와 연산자([1,-2,1] 시간축 2차 차분)는 같지만, 관절 축을
+    평균이 아니라 max로 접는다. 평균은 한 관절에서 튄 팝을 1/21로 희석해 지워버리는데,
+    시청자가 보는 결함은 바로 그 한 관절의 팝이다. 이 값들의 p95가 jitter_p95_after다.
+    """
+    if global_pos.shape[0] < 3:
+        return torch.zeros(0)
+    accel = global_pos[2:] - 2 * global_pos[1:-1] + global_pos[:-2]
+    return torch.norm(accel, dim=-1).max(dim=-1).values * 100.0
 
 
 def calculate_intent_dyn(gp_out, gp_in):
@@ -580,6 +605,10 @@ def _eval_one_scenario(scenario, model, physics_engine, ALL_PAIRS, test_files,
     proj_residual_max = 0.0     # 사영이 '스스로' 보고한 잔존 최대 관통(cm).
     #   [주의] max_pen4_after_cm 을 복사해 넣으면 교차검증이 무의미해진다 — 이 값은 projection.py가
     #      독립적으로 계산한 것이어야 하고, 두 수가 일치하는지가 곧 검증이다.
+    # [R1.5-4] 저역통과 필터 계측기 — 모델 forward/사영 시간과 '분리해서' 잰다.
+    lp_ms, lp_delta_deg = [], []
+    # 프레임별 최악관절 가속도. 필터 유무와 무관하게 모으며, 여기서 jitter_p95_after가 나온다.
+    frame_jit_after = []
     n_joint_total = 0                                    # 총 (프레임 × 관절) 수
     pck_joint_hit = {t: 0 for t in PCK_THRESHOLDS_CM}    # 관절 단위 통과 수
     pck_frame_hit = {t: 0 for t in PCK_THRESHOLDS_CM}    # 프레임 '전원 통과' 수 (R1의 이벤트 형태)
@@ -608,9 +637,18 @@ def _eval_one_scenario(scenario, model, physics_engine, ALL_PAIRS, test_files,
             win_ms.append((time.perf_counter() - _t0) * 1000.0)
             corr = recon.squeeze(0).cpu()                   # [30, 87] 모델 교정 결과
 
-            # [주의] 파이프라인 순서: 모델 → (저역통과 필터 자리 — R1.5-4, 아직 없음) → 사영.
-            #    필터를 사영 '뒤'에 두면 저역통과가 사영 결과를 뭉개 관통을 되살린다
-            #    (실측: persistent max_pen4 0.138 → 4.939cm). 필터가 생기면 바로 이 줄 위에 넣는다.
+            # [주의] 파이프라인 순서: 모델 → 저역통과 필터 → 사영. 이 순서는 취향이 아니라
+            #    정확성 조건이다. 필터를 사영 '뒤'에 두면 저역통과가 사영 결과를 뭉개 관통을
+            #    되살린다 (실측: persistent max_pen4 0.138 → 4.939cm). 아래 두 블록의 순서를
+            #    절대 바꾸지 말 것. inference.py / demo_maker.py도 같은 순서를 지킨다.
+            if lowpass.LP_ENABLED:
+                # hips(:3)는 필터에 넣지 않는다 (D5: 교정 대상이 아닌 통과값). lowpass_window는
+                # 87차원을 받으면 RuntimeError로 즉시 실패하므로 이 슬라이싱이 계약이다.
+                q_lp, lstats = lowpass.lowpass_window(corr[:, 3:])
+                corr = torch.cat([corr[:, :3], q_lp], dim=1)
+                lp_ms.append(lstats["ms"])
+                lp_delta_deg.append(lstats["delta_deg_mean"])
+
             if projection.PROJ_ENABLED:
                 q_proj, pstats = projection.project_window(
                     physics_engine, corr[:, :3], corr[:, 3:], MONITORED_PAIRS)
@@ -708,6 +746,7 @@ def _eval_one_scenario(scenario, model, physics_engine, ALL_PAIRS, test_files,
             # (4) Jitter(참고 지표): 부드러움
             jit_before.append(calculate_acceleration_jitter(gp_input))
             jit_after.append(calculate_acceleration_jitter(gp_corr))
+            frame_jit_after.append(calculate_frame_jitter_max(gp_corr))
 
             # (5) 뼈 길이 변동성(고정 오프셋이므로 구조적으로 0)
             bl = []
@@ -758,6 +797,23 @@ def _eval_one_scenario(scenario, model, physics_engine, ALL_PAIRS, test_files,
         proj_move_mean = float(np.mean(proj_moves)) if proj_moves else 0.0
     else:
         proj_ms_mean = proj_ms_frame = proj_frames_pct = proj_move_mean = None
+
+    # [R1.5-4] 필터 비용/작동량 집계. 워밍업 규약은 모델·사영 계측과 동일하게 맞춘다.
+    if lp_ms:
+        ltimed = lp_ms[TIMING_WARMUP_FILES:] if len(lp_ms) > TIMING_WARMUP_FILES else lp_ms
+        lp_ms_mean = float(np.mean(ltimed))
+        lp_ms_frame = lp_ms_mean / SEQ_LEN
+        lp_delta_mean = float(np.mean(lp_delta_deg)) if lp_delta_deg else 0.0
+    else:
+        lp_ms_mean = lp_ms_frame = lp_delta_mean = None
+
+    # 프레임별 최악관절 가속도의 p95 (전 파일 프레임을 한데 모아 계산 — 파일별 p95의 평균이
+    # 아니다. 팝은 특정 파일에 몰리므로 파일 단위로 먼저 접으면 그 꼬리가 사라진다).
+    if frame_jit_after:
+        _fj = torch.cat(frame_jit_after).numpy()
+        jitter_p95 = float(np.percentile(_fj, 95)) if _fj.size else None
+    else:
+        jitter_p95 = None
 
     # 선형 침투 지표 집계
     clean_before_pct = 100.0 * (1.0 - n_coll_frames_before / max(n_frames_total, 1))
@@ -920,6 +976,23 @@ def _eval_one_scenario(scenario, model, physics_engine, ALL_PAIRS, test_files,
               f"{proj_ms_frame:.4f} ms/frame")
         print(f"    ↳ 모델+사영 합계 {total_ms_frame:.4f} ms/frame "
               f"(사전등록 예산 1.0 ms/frame {'통과' if total_ms_frame <= 1.0 else '초과 ⚠️'})")
+
+    # ── [6] 저역통과 필터 (R1.5-4). LP_ENABLED=False면 이 블록 자체가 출력되지 않는다. ──
+    if lp_ms_mean is not None:
+        budget_ms = (infer_ms_frame or 0.0) + (proj_ms_frame or 0.0) + lp_ms_frame
+        print(f"\n[6] 저역통과 필터 — mode={lowpass.LP_MODE}, window={lowpass.LP_WINDOW}, "
+              f"edge={lowpass.LP_EDGE}")
+        print(f"  ▶ 필터가 바꾼 회전량   : {lp_delta_mean:.4f} deg (관절 평균)")
+        print(f"  ▶ 비용                 : {lp_ms_mean:.3f} ms/윈도우 = "
+              f"{lp_ms_frame:.4f} ms/frame")
+        print(f"    ↳ 모델+필터+사영 합계 {budget_ms:.4f} ms/frame "
+              f"(사전등록 예산 1.0 ms/frame {'통과' if budget_ms <= 1.0 else '초과 ⚠️'})")
+        print("    ↳ ⚠️ 필터 단독 행은 합격 판정 대상이 아니다 — 저역통과는 사영이 없앤 관통을")
+        print("       되살리므로(persistent max_pen4 0.138 → 4.939cm 실측), max_pen4 가드레일은")
+        print("       '필터+사영' 결합 구성에서만 판정한다 (계획서 §6에 사전등록된 예외).")
+    if jitter_p95 is not None:
+        print(f"  ▶ 프레임별 최악관절 가속도 p95 : {jitter_p95:.4f} cm/frame^2 "
+              f"(평균 {ja_m:.4f} — 국소 팝은 평균이 아니라 이 값에서 보인다)")
     print("=" * 60)
 
     # ---- 실험 기록: 시나리오별 집계 지표를 CSV 한 줄로 저장 ----------
@@ -997,6 +1070,16 @@ def _eval_one_scenario(scenario, model, physics_engine, ALL_PAIRS, test_files,
         "proj_frames_pct": round(proj_frames_pct, 2) if proj_frames_pct is not None else "",
         "proj_residual_max_cm": round(proj_residual_max, 3) if projection.PROJ_ENABLED else "",
         "proj_move_cm": round(proj_move_mean, 4) if proj_move_mean is not None else "",
+        # [R1.5-4 저역통과 필터] 사영과 같은 규약: OFF일 때도 lp_mode="off"를 남긴다.
+        #   lp_window는 OneEuro 모드에서 창 개념이 없으므로 min_cutoff를 기록한다(계획서 §4.3).
+        "lp_mode": lowpass.LP_MODE if lowpass.LP_ENABLED else "off",
+        "lp_window": ((lowpass.LP_ONE_EURO_MIN_CUTOFF if lowpass.LP_MODE == "one_euro"
+                       else lowpass.LP_WINDOW) if lowpass.LP_ENABLED else ""),
+        "lp_beta": (lowpass.LP_ONE_EURO_BETA
+                    if lowpass.LP_ENABLED and lowpass.LP_MODE == "one_euro" else ""),
+        "lp_ms_per_frame": round(lp_ms_frame, 4) if lp_ms_frame is not None else "",
+        # 필터 유무와 무관하게 항상 기록한다 (필터 도입 전후를 같은 잣대로 비교하기 위해).
+        "jitter_p95_after": round(jitter_p95, 4) if jitter_p95 is not None else "",
     }
     csv_path = append_results_csv(row)
     print(f"📝 시나리오 '{scenario}' 집계 지표가 '{csv_path}'에 기록되었습니다 "

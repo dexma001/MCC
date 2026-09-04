@@ -27,7 +27,7 @@ LEARNING_RATE = 1e-4
 #     (inference.py는 CSV에 기록하지 않는 단발 시각화용이라 이 경로에 필요하지 않다.)
 #   - 교정 강도는 절대값이 아니라 상대 비율(LAMBDA_PHYS / LAMBDA_RECON)이 결정하므로
 #     LAMBDA_RECON은 1.0으로 고정(anchor)하고 LAMBDA_PHYS만 스윕하는 것이 표준 방식입니다.
-#
+# 
 #   BETA_KL 주의: 이 아키텍처(TransformerDenoiser)에는 KL 손실이 '존재하지 않는다'.
 #   아래 상수는 오직 run 폴더 이름(make_run_name)과 공유 평가 코드의 import 호환을
 #   위해서만 존재하며, 손실 계산에는 절대 쓰이지 않는다. 0.0 고정 — 바꾸지 말 것.
@@ -50,7 +50,7 @@ BETA_KL      = 0.0   # [주의] 손실 아님 — run 폴더 이름/평가 코�
 #   비율은 유형별 평가 행(evaluate.py 시나리오)으로 검증 후 조정한다 — 하드코딩 금지.
 # =====================================================================
 DECLIP_MODE = True                            # False = 구(舊) 클린→클린 정규화 학습 (비교/재현용)
-RUN_TAG_BASE = "tfm_declip_cov_MSEOnly_1.1"         # 'tfm' 접두어 → PVTVAE run 폴더와 절대 충돌 안 함
+RUN_TAG_BASE = "tfm_declip_cov_MSEOnly_1.3"         # 'tfm' 접두어 → PVTVAE run 폴더와 절대 충돌 안 함
 # [주의] 캡슐 반지름 시대 구분자를 '자동으로' 덧붙인다 (2026-08-12 해부학 반지름 도입).
 #    반지름이 바뀌면 물리 손실 임계값·주입 깊이 목표·전 지표가 함께 바뀌므로, 태그를 손으로
 #    붙이는 것을 잊으면 같은 λ의 구시대 폴더에서 resume해 실험이 조용히 오염된다.
@@ -224,9 +224,8 @@ def train():
             recon_quats  = recon_motion[..., 3:]   # [B, 30, 84]
 
             loss_recon_quat = nn.MSELoss()(recon_quats, target_quats)
-            loss_sparsity = nn.L1Loss()(recon_quats, target_quats)
 
-            loss_recon = loss_recon_quat *1.1 # + loss_sparsity * 0.1
+            loss_recon = loss_recon_quat * 1.3 # + loss_sparsity * 0.1
 
             # 물리 엔진 연동: FK로 관절 월드 좌표 복원 → 충돌 Loss
             loss_phys = torch.tensor(0.0, device=DEVICE)

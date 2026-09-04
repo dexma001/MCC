@@ -43,6 +43,10 @@ from dataset_pipeline import (PARENTS, BONE_RADII, get_split_files,
                               find_latest_checkpoint_in, list_available_runs)
 from physics_module import DifferentiablePhysics
 import corruption
+# [R1.5-4 / R1.5-3] 후처리 레이어. evaluate.py와 '같은 모듈, 같은 순서'를 쓰는 것이 핵심이다
+#   — 데모가 평가와 다른 파이프라인을 보여주면 발표 수치와 화면이 어긋난다.
+import lowpass
+import projection
 # 데모 대상 실험은 train.py의 설정으로 선택 (evaluate.py와 동일한 방식 — mtime 아님)
 from train import LAMBDA_RECON, LAMBDA_PHYS, BETA_KL, RUN_TAG, COLLIDING_PAIRS
 
@@ -71,9 +75,50 @@ TARGET_FILE = "" # processed_motions_VMC/dataset-1_call_normal_001.pt
 DEMO_MIN_DEPTH_CM = 2.0        # 화면에서 잘 보이는 최소 주입 깊이 — 두 시나리오 모두에 적용
 MAX_FILE_TRIES = 30            # 재추첨 상한 (초과 시 그때까지 최선의 후보 사용)
 
+# =====================================================================
+# [후처리 파이프라인] 모델 → 저역통과 필터 → 사영. 이 순서는 취향이 아니라 정확성 조건이다.
+#   필터를 사영 '뒤'에 두면 저역통과가 사영 결과를 뭉개 관통을 되살린다
+#   (V4 실측 2026-08-26, held-out 20파일: 4시나리오 전부 0.000cm → 4.58~5.11cm).
+#   evaluate.py:_eval_one_scenario 와 동일한 순서이며, 바꾸지 말 것.
+# [주의] 아래 두 스위치는 lowpass.LP_ENABLED / projection.PROJ_ENABLED 와 별개다.
+#   평가 기본값(LP_ENABLED=False)은 회귀 게이트를 성립시키기 위한 것이고, 데모는
+#   '완성된 파이프라인을 보여주는' 경로이므로 여기서 독립적으로 켠다. 실제로 어떤 구성이
+#   쓰였는지는 demo_meta.json의 pipeline 항목에 기록된다.
+# =====================================================================
+DEMO_LOWPASS = True            # 모델 출력에 저역통과 필터 적용 (lowpass.LP_MODE/LP_WINDOW 사용)
+DEMO_PROJECTION = True         # 필터 뒤에 사영 적용 (projection.PROJ_K/PROJ_OMEGA 사용)
+
+# 결과 애니메이션 저장 — viz_motion의 COMPARE 뷰어를 그대로 재사용한다(렌더링 코드 중복 금지).
+DEMO_SAVE_GIF = True           # demo_results/<DEMO_GIF_NAME> 으로 gif 저장
+DEMO_GIF_NAME = "compare.gif"
+DEMO_SHOW_ANIMATION = False    # True면 gif 저장 후 재생 창까지 띄운다(창을 닫아야 스크립트가 끝난다).
+                               # 지터/뭉개짐은 정지 그림으로 판단할 수 없으므로, 눈으로 볼 때는
+                               # 이 값을 True로 두거나 viz_motion.py compare 를 따로 실행한다.
+
 # 주입 '형태'는 학습/평가와 동일한 설계 기본값. transient만 주입기 '내부' 재추첨 하한을
 # 데모 가시성 기준으로 올린다 (각도/길이 분포 U[15°,70°]·5~20프레임은 그대로).
 DEMO_CFG = corruption.make_cfg(transient_min_depth_cm=max(0.3, DEMO_MIN_DEPTH_CM))
+
+
+def save_compare_gif(results_dir, gif_name=DEMO_GIF_NAME, show=DEMO_SHOW_ANIMATION):
+    """demo_results/의 Before/After를 viz_motion의 COMPARE 뷰어로 렌더링해 gif로 저장한다.
+
+    [주의] viz_motion.py 는 의도적으로 GitHub에서 제외된 로컬 전용 파일이다(.gitignore).
+       따라서 여기서는 최상단 import가 아니라 '지연 import + 명시적 안내'로 처리한다 —
+       새로 클론한 환경에서 데모 생성 자체가 ImportError로 죽으면 안 되기 때문이다.
+       렌더링 코드를 여기에 복제하지 않는 이유도 같다: 캡슐/침투 색 규칙이 두 벌이 되면
+       화면과 수치가 갈라진다 (viz_motion의 probe가 물리 엔진과 같은 기준을 쓴다).
+    """
+    gif_path = os.path.join(results_dir, gif_name)
+    try:
+        import viz_motion
+    except ImportError as e:
+        print(f"⚠️ gif 저장을 건너뜁니다 — viz_motion.py를 불러올 수 없습니다 ({e}).")
+        print("   (viz_motion.py는 로컬 전용 파일입니다. 저장 없이 결과 .pt만 사용하세요.)")
+        return None
+    print(f"🎞️ 애니메이션 렌더링 중 → {gif_path}")
+    viz_motion.visualize_compare(results_dir=results_dir, save_path=gif_path, show=show)
+    return gif_path
 
 
 def create_demo():
@@ -111,6 +156,16 @@ def create_demo():
             motion_87[:, :3], motion_87[:, 3:], COLLIDING_PAIRS) * 100.0   # [F, P] cm
         fmax = dep.max(dim=1).values
         return float(fmax.max()), int((fmax > 1e-4).sum())
+
+    def jitter_report(motion_87):
+        """관절 위치 가속도 크기의 평균 (cm/frame^2). evaluate.calculate_acceleration_jitter와
+        같은 [1,-2,1] 시간축 2차 차분이며, 저역통과 필터가 실제로 무엇을 줄였는지 보여준다.
+        (evaluate를 import하지 않는 이유: 데모가 평가 모듈의 전역 설정에 묶이지 않게 한다.)"""
+        gp = physics.compute_global_pos_tensor(motion_87[:, :3], motion_87[:, 3:])
+        if gp.shape[0] < 3:
+            return 0.0
+        accel = gp[2:] - 2 * gp[1:-1] + gp[:-2]
+        return float(torch.norm(accel, dim=-1).mean()) * 100.0
 
     # 2. 소스 모션: held-out 테스트 분할에서 추첨, 주입이 목표 깊이의 충돌을 만들 때까지
     #    파일을 재추첨한다 (rejection sampling — 주입은 포즈에 따라 무충돌일 수 있음).
@@ -177,13 +232,46 @@ def create_demo():
     maxpen_b, ncoll_b = depth_report(demo_motion)
     print(f"주입된 충돌(Before): 최대 침투 {maxpen_b:.2f} cm | 충돌 프레임 {ncoll_b}/{demo_motion.shape[0]}")
 
-    # 3. AI 교정 (Inference)
+    # 3. AI 교정 (Inference) — 모델 → 저역통과 필터 → 사영
     with torch.no_grad():
         recon_motion, _, _ = model(demo_motion.unsqueeze(0).to(DEVICE))
     corrected_motion = recon_motion.squeeze(0).cpu()                  # [30, 87]
 
+    # 단계별 수치를 전부 남긴다 — 어느 레이어가 무엇을 했는지 화면에서 바로 보이도록.
+    # (필터는 지터를, 사영은 관통을 담당하므로 두 축을 함께 찍어야 역할이 드러난다.)
+    stage_rows = [("모델 출력", corrected_motion)]
+
+    if DEMO_LOWPASS:
+        # hips(:3)는 필터에 넣지 않는다 (교정 대상이 아닌 통과값). lowpass_window는 87차원을
+        # 받으면 RuntimeError로 즉시 실패하므로 이 슬라이싱이 곧 계약이다.
+        q_lp, lp_stats = lowpass.lowpass_window(corrected_motion[:, 3:])
+        corrected_motion = torch.cat([corrected_motion[:, :3], q_lp], dim=1)
+        stage_rows.append((f"+ 저역통과({lowpass.LP_MODE}, w={lp_stats['window']})", corrected_motion))
+    else:
+        lp_stats = None
+
+    if DEMO_PROJECTION:
+        q_pr, proj_stats = projection.project_window(
+            physics, corrected_motion[:, :3], corrected_motion[:, 3:], COLLIDING_PAIRS)
+        corrected_motion = torch.cat([corrected_motion[:, :3], q_pr], dim=1)
+        stage_rows.append((f"+ 사영(K={projection.PROJ_K}, w={projection.PROJ_OMEGA})", corrected_motion))
+    else:
+        proj_stats = None
+
+    print(f"\n[파이프라인] 모델 → "
+          f"{'저역통과 → ' if DEMO_LOWPASS else ''}{'사영' if DEMO_PROJECTION else ''}".rstrip(' →'))
+    print(f"  {'단계':<26}{'최대 침투':>10}{'충돌 프레임':>12}{'지터':>10}")
+    print(f"  {'입력(주입됨)':<24}{maxpen_b:>10.2f}{ncoll_b:>10}/{demo_motion.shape[0]:<3}"
+          f"{jitter_report(demo_motion):>10.4f}")
+    stage_log = []
+    for name, m in stage_rows:
+        mp, nc = depth_report(m)
+        jt = jitter_report(m)
+        print(f"  {name:<24}{mp:>10.2f}{nc:>10}/{m.shape[0]:<3}{jt:>10.4f}")
+        stage_log.append({"stage": name, "max_pen_cm": round(mp, 3),
+                          "collision_frames": nc, "jitter": round(jt, 4)})
+
     maxpen_a, ncoll_a = depth_report(corrected_motion)
-    print(f"교정 후 충돌(After) : 최대 침투 {maxpen_a:.2f} cm | 충돌 프레임 {ncoll_a}/{corrected_motion.shape[0]}")
 
     # 4. 시각화 툴이 읽도록 저장 ([30, 87]) — Before = 손상 입력, After = 모델 출력
     results_dir = "demo_results" if os.path.exists("processed_motions_VMC") else "../demo_results"
@@ -211,13 +299,37 @@ def create_demo():
         "max_pen_after_cm": round(maxpen_a, 2),
         "collision_frames_before": ncoll_b,
         "collision_frames_after": ncoll_a,
+        # 어떤 후처리 구성으로 만든 결과인지 — 이게 없으면 같은 체크포인트의 서로 다른
+        # 파이프라인 결과가 meta만 보고 구분되지 않는다 (CSV의 proj_mode/lp_mode와 같은 역할).
+        "pipeline": {
+            "order": "model -> lowpass -> projection",
+            "lowpass": ({"mode": lowpass.LP_MODE, "window": lp_stats["window"],
+                         "edge": lowpass.LP_EDGE,
+                         "delta_deg_mean": round(lp_stats["delta_deg_mean"], 4)}
+                        if lp_stats is not None else "off"),
+            "projection": ({"k": projection.PROJ_K, "omega": projection.PROJ_OMEGA,
+                            "margin_cm": projection.PROJ_MARGIN_CM,
+                            "pairs": projection.PROJ_PAIRS,
+                            "frames_touched": proj_stats["frames_touched"],
+                            "residual_max_cm": round(proj_stats["residual_max_cm"], 4),
+                            "move_cm": round(proj_stats["move_cm"], 4)}
+                           if proj_stats is not None else "off"),
+        },
+        "stages": stage_log,
     }
     with open(os.path.join(results_dir, "demo_meta.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2, ensure_ascii=False)
 
+    # 5. 결과 애니메이션 저장 (요청 시). 렌더링은 viz_motion의 COMPARE 뷰어를 그대로 쓴다.
+    gif_path = save_compare_gif(results_dir) if DEMO_SAVE_GIF else None
+
     print(f"이 데모 재현: DEMO_SEED={DEMO_SEED} python AI_model/demo_maker.py "
           f"(+ TARGET_FILE='{target_file}' 고정 시 완전 동일)")
-    print("준비 완료! 이제 'python AI_model/viz_motion.py compare' 로 결과를 확인하세요.")
+    if gif_path:
+        print(f"저장된 결과: {os.path.relpath(gif_path)} (gif) + sample_original.pt / "
+              f"sample_corrected.pt / demo_meta.json")
+    print("준비 완료! 실시간 재생으로 보려면 'python AI_model/viz_motion.py compare' 를 실행하세요 "
+          "(지터·뭉개짐은 정지 그림으로 판단할 수 없습니다).")
 
 
 if __name__ == "__main__":

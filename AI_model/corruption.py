@@ -553,7 +553,7 @@ def _inject_persistent_group(src, idxs, ev, cfg, rng, S):
         seg_lo = torch.tensor([s[2] for s in specs], device=dev, dtype=torch.long)
         seg_hi = torch.tensor([s[3] for s in specs], device=dev, dtype=torch.long)
         cov_t, med_t, mx_t = _seg_stats_batched(frame_depths, seg_lo, seg_hi)
-        stats = torch.stack([cov_t, med_t, mx_t], dim=1).cpu().tolist()        # 전송 1회
+        stats = torch.stack([cov_t, med_t, mx_t], dim=1).cpu().tolist()        
 
         # 샘플별 후보 결과 취합. 깊이 판정은 '윈도우 max'가 아니라 주입 구간의
         # (coverage, 중앙값)으로 한다 — 지속형의 정의가 '구간 내내 관통'이기 때문.
@@ -589,7 +589,7 @@ def _inject_persistent_group(src, idxs, ev, cfg, rng, S):
                 below = [(t, d) for t, d in ax_entries if d < lo]
                 above = [(t, d) for t, d in ax_entries if d > hi]
                 if above:
-                    t_lo = max((t for t, _d in below), default=0.0)   # 얕은 쪽 (없으면 0°)
+                    t_lo = max((t for t, _d in below), default=0.0)   # 얕은 쪽 
                     t_hi = min(t for t, _d in above)                  # 과침투 쪽
                     mids = [t_lo + (t_hi - t_lo) * f for f in (0.25, 0.5, 0.75)]
                     refine = (entries[0][1]['bone'], list(ax_key), mids)
@@ -692,7 +692,7 @@ def corrupted_batches(dataloader, physics, cfg, rng, pairs, prefetch=2):
     목적: 주입이 CPU에서 도는 동안 GPU가 노는 것을 막는다. GPU가 배치 N을 학습하는 동안
     배치 N+1의 주입을 준비해 주입 비용을 GPU 시간 뒤로 숨긴다 (에폭 ≈ max(주입, GPU) + ε).
 
-    [주의] 주입을 GPU에서 수행하면(윈도우 텐서를 CUDA에 올려 호출) 학습 스텝과 같은 스트림을
+    ⚠️ 주입을 GPU에서 수행하면(윈도우 텐서를 CUDA에 올려 호출) 학습 스텝과 같은 스트림을
        쓰므로 겹칠 것이 없어 이 프리페치는 이득이 아니라 손해가 된다(실측 1.6배). GPU 경로를
        택할 때는 이 제너레이터 대신 corrupt_batch를 직접 부를 것.
 
