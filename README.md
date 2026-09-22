@@ -1,5 +1,11 @@
 # MCC (Motion Capture Correction)
 
+### Thanks to
+서울과학기술대학교 전자공학과 박민기 지도교수님 (mkpark@seoultech.ac.kr)  
+서울과학기술대학교 전자공학과 이형민 교수님 (https://hyeongminlee.github.io/)  
+모션 테크놀로지스 주식회사 김성혁님 (ksh@motioncapture.co.kr)
+
+
 2026 Capsone Project
 
 모션캡처(VMC) 결과에서 몸을 관통하는 **자기충돌(self-collision)을 제거**하되, 원래 동작의
@@ -29,7 +35,7 @@
 
 - **projection**: 미분가능 사영 레이어 — 네트워크 출력 뒤에서 관통을 기하학적으로 밀어낸다
     + 선형화 제약 사영(PBD 계열)을 반복해 `collision <= eps`를 강제한다
-    + 손잡이: `PROJ_ENABLED` / `PROJ_K=8` / `PROJ_OMEGA=1.8` / `PROJ_MARGIN_CM=0.2` / `PROJ_PAIRS`
+    + 손잡이: `PROJ_ENABLED` / `PROJ_K=24` / `PROJ_OMEGA=1.8` / `PROJ_MARGIN_CM=0.2` / `PROJ_PAIRS`
     + 위반 프레임이 없으면 즉시 종료 → 클린 입력에 대해 항등
 
 - **models**: TransformerDenoiser (기본 아키텍처, 결정론적 — VAE 아님)
@@ -102,7 +108,7 @@
 ## 2. Workflow
 #### 현재 진행중인 모든 학습의 원본 데이터는 https://github.com/BandaiNamcoResearchInc/Bandai-Namco-Research-Motiondataset 에 있음.
 
-Sample_Data: Bandai_Dataset_csv_modi_tot 사용
+Sample_Data: Bandai-Namco-Research-Motiondataset 사용
 - .csv 추출 과정: .bvh -> Blender (->.fbx) -> Unity(.csv)
 
 실행 순서:

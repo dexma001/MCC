@@ -16,7 +16,7 @@ from models import TransformerDenoiser
 # 1. 하이퍼파라미터 및 환경 설정
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-EPOCHS = 100
+EPOCHS = 500
 BATCH_SIZE = 32
 LEARNING_RATE = 1e-4
 
@@ -34,7 +34,7 @@ LEARNING_RATE = 1e-4
 #   (KL을 실제로 쓰는 PVTVAE 실험을 재현하려면 PVTVAE_baseline/train.py 를 사용한다.)
 # =====================================================================
 LAMBDA_RECON = 1.0   # 복구 타겟(클린 정답) 충실도 가중치 (anchor, 고정 권장)
-LAMBDA_PHYS  = 0.3   # 충돌 제거(collision) 목표 가중치 — 스윕 그리드를 바꿔가며 실험
+LAMBDA_PHYS  = 0.5   # 충돌 제거(collision) 목표 가중치 — 동결 v1 값 (2026-09-11 복원)
 BETA_KL      = 0.0   # [주의] 손실 아님 — run 폴더 이름/평가 코드 호환용 상수 (0.0 고정)
 
 # =====================================================================
@@ -50,7 +50,7 @@ BETA_KL      = 0.0   # [주의] 손실 아님 — run 폴더 이름/평가 코�
 #   비율은 유형별 평가 행(evaluate.py 시나리오)으로 검증 후 조정한다 — 하드코딩 금지.
 # =====================================================================
 DECLIP_MODE = True                            # False = 구(舊) 클린→클린 정규화 학습 (비교/재현용)
-RUN_TAG_BASE = "tfm_declip_cov_MSEOnly_1.3"         # 'tfm' 접두어 → PVTVAE run 폴더와 절대 충돌 안 함
+RUN_TAG_BASE = "tfm_declip_cov_l10.1"               # 'tfm' 접두어 → PVTVAE run 폴더와 절대 충돌 안 함
 # [주의] 캡슐 반지름 시대 구분자를 '자동으로' 덧붙인다 (2026-08-12 해부학 반지름 도입).
 #    반지름이 바뀌면 물리 손실 임계값·주입 깊이 목표·전 지표가 함께 바뀌므로, 태그를 손으로
 #    붙이는 것을 잊으면 같은 λ의 구시대 폴더에서 resume해 실험이 조용히 오염된다.
@@ -224,8 +224,12 @@ def train():
             recon_quats  = recon_motion[..., 3:]   # [B, 30, 84]
 
             loss_recon_quat = nn.MSELoss()(recon_quats, target_quats)
+            # [동결 v1 복원 2026-09-11] L1 희소성 항 (alpha=0.1). git b01c1fc 와 동일한 형태다.
+            #   L1 은 '작은 오차'를 지배해 항등 근방에서 일정한 압력을 유지한다 — MSE-only 실험
+            #   (alpha=0)은 두 lambda 모두에서 do-no-harm 을 깨뜨렸다. 이 항은 하중을 받는다.
+            loss_sparsity = nn.L1Loss()(recon_quats, target_quats)
 
-            loss_recon = loss_recon_quat * 1.3 # + loss_sparsity * 0.1
+            loss_recon = loss_recon_quat + loss_sparsity * 0.1
 
             # 물리 엔진 연동: FK로 관절 월드 좌표 복원 → 충돌 Loss
             loss_phys = torch.tensor(0.0, device=DEVICE)
