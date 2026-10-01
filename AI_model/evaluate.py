@@ -242,7 +242,7 @@ def load_run_config(run_dir):
     return {}
 
 
-def append_results_csv(row, csv_path="evaluate_results.csv"):
+def append_results_csv(row, csv_path="docs/evaluate_results.csv"):  # [2026-10-02] 결과 CSV·HTML 은 docs/
     """
     시나리오×람다 설정별 '테스트셋 집계' 지표를 CSV 한 줄로 누적 기록한다 (실험 기록용).
     컬럼이 추가/변경되면 기존 파일을 새 헤더로 자동 마이그레이션한다

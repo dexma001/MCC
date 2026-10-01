@@ -41,7 +41,7 @@ _ROOT = os.path.dirname(_HERE)
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
-DEFAULT_OUT = "evaluate_epoch.csv"
+DEFAULT_OUT = "docs/evaluate_epoch.csv"   # [2026-10-02] 결과 CSV·HTML 은 docs/ (_ROOT 기준)
 
 
 def _existing_epochs(run_dir):

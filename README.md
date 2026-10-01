@@ -58,7 +58,7 @@
     + Input_1: 가지고 있는 Random Sample Data(maybe Clean) + Artifical Collision
     + Output: Model(Input_1)
 
-- **evaluate**: 시나리오별로 테스트셋을 평가해 `evaluate_results.csv`에 1행씩 기록
+- **evaluate**: 시나리오별로 테스트셋을 평가해 `docs/evaluate_results.csv`에 1행씩 기록
     + 시나리오: `clean`(항등 보존) / `legacy80`(LeftUpperArm +80°, 학습 분포 외 심층 손상) /
       `transient` / `persistent` — 평가 시드 고정으로 같은 손상이 재현된다
     + 평가할 실험은 train.py의 λ·run 태그 설정으로 고른다
@@ -76,7 +76,7 @@
 
 - **requirements.txt**: Python 3.11.9 / torch 2.2.2+cu121 등 고정 버전
 
-- **evaluate_results.csv**: evaluate.py가 누적 기록하는 실험 로그
+- **docs/**: 결과 CSV(`evaluate_results.csv` = evaluate.py가 누적 기록하는 실험 로그, `evaluate_epoch*.csv` 등)와 같은 이름의 그래프 HTML. GitHub Pages(main /docs)로 브라우저에서 열람
   (신규 컬럼은 맨 뒤에만 추가 — xlsx가 컬럼 위치를 참조한다)
 - **evaluate_visualize.xlsx**: 위 CSV를 정리·시각화한 사본
 
@@ -115,5 +115,5 @@ Sample_Data: Bandai-Namco-Research-Motiondataset 사용
 1. `python preprocess_motion.py` — 원본 .csv 정규화 (좌표계 / up-axis 보정)
 2. `python AI_model/preprocess.py` — .csv → .pt
 3. `python AI_model/train.py` — λ·run 태그 설정 후 학습
-4. `python AI_model/evaluate.py` — 시나리오별 평가 → `evaluate_results.csv`
+4. `python AI_model/evaluate.py` — 시나리오별 평가 → `docs/evaluate_results.csv`
 5. `python AI_model/inference.py` / `demo_maker.py` — 단발 결과 산출

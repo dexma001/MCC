@@ -71,7 +71,7 @@ DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 #   ⚠️ 따라서 large@500 을 소형 대조군(BASELINE_RUN, 100 에폭)과 직접 비교하면
 #      아키텍처와 학습 예산이 함께 바뀐 비교가 된다. 소형도 500 으로 이어 학습해야
 #      "아키텍처만 다른 A/B"가 복원된다.
-EPOCHS = 500
+EPOCHS = 3000
 BATCH_SIZE = 32
 LEARNING_RATE = 1e-4
 
