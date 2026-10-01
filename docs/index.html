@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MCC 평가 결과</title>
+<style>
+:root {
+  color-scheme: light;
+  --page: #f4f4f2; --surface-1: #fcfcfb; --border: #e2e1dc;
+  --text-primary: #0b0b0b; --text-secondary: #52514e; --text-muted: #7c7b76; --accent: #2a78d6;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --page: #111110; --surface-1: #1a1a19; --border: #33332f;
+    --text-primary: #ffffff; --text-secondary: #c3c2b7; --text-muted: #8f8e86; --accent: #3987e5;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #111110; --surface-1: #1a1a19; --border: #33332f;
+  --text-primary: #ffffff; --text-secondary: #c3c2b7; --text-muted: #8f8e86; --accent: #3987e5;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--page); color: var(--text-primary);
+  font: 15px/1.55 system-ui, -apple-system, "Segoe UI", "Malgun Gothic", "Apple SD Gothic Neo", sans-serif; }
+main { max-width: 880px; margin: 0 auto; padding: 40px 16px 56px; }
+header h1 { font-size: 26px; margin: 0 0 6px; letter-spacing: -0.01em; }
+header p { margin: 0; color: var(--text-secondary); }
+.meta { margin-top: 6px; font-size: 13px; color: var(--text-muted); }
+.list { display: grid; gap: 12px; margin-top: 28px; }
+.card { display: block; padding: 16px 18px; border: 1px solid var(--border); border-radius: 10px;
+  background: var(--surface-1); color: inherit; text-decoration: none; transition: border-color .15s; }
+.card:hover, .card:focus-visible { border-color: var(--accent); outline: none; }
+.card h2 { margin: 0 0 4px; font-size: 16px; color: var(--accent); word-break: break-all; }
+.card p { margin: 4px 0 0; }
+.desc { color: var(--text-primary); }
+.models { font-size: 13px; color: var(--text-secondary); word-break: break-all; }
+.facts { font-size: 13px; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.gen { margin-left: 10px; }
+footer { margin-top: 28px; font-size: 13px; color: var(--text-muted); }
+</style>
+</head>
+<body>
+<main>
+<header>
+  <h1>MCC 평가 결과</h1>
+  <p>MCC (Motion Capture Correction) 모델의 평가 지표 그래프 목록입니다. 항목을 누르면 대화형 그래프가 열립니다.</p>
+  <p class="meta">4개 페이지 · 목차 생성 2026-10-02 02:32</p>
+</header>
+<nav class="list">
+<a class='card' href='compare_l10.1_vs_MSEOnly_1.3.html'><h2>compare_l10.1_vs_MSEOnly_1.3</h2><p class='desc'>l10.1_phys0.5 · MSEOnly_1.3_e500_phys0.3 · tfmL_d256h8L4f1024_phys0.3 세 모델의 배포 구성 에폭 곡선 비교 (ep ≤ 3000, 학습 손실 열 포함)</p><p class='models'>MSEOnly_1.3_e500_phys0.3 · l10.1_phys0.5 · tfmL_d256h8L4f1024_phys0.3</p><p class='facts'>960행 · 지표 19개 · epoch 20–3000 · 모델 3개<span class='gen'>생성 2026-10-02 02:26</span></p></a>
+<a class='card' href='evaluate_epoch_4000_wide.html'><h2>evaluate_epoch_4000_wide</h2><p class='desc'>에폭 × 지표 가로형 표 — 세 모델, 배포(deploy)·모델 단독(modelonly)</p><p class='models'>MSEOnly_1.3_e500_phys0.3 · l10.1_phys0.5 · tfmL_d256h8L4f1024_phys0.3</p><p class='facts'>1,520행 · 지표 12개 · epoch 20–4000 · 모델 3개<span class='gen'>생성 2026-10-02 02:26</span></p></a>
+<a class='card' href='evaluate_epoch_all.html'><h2>evaluate_epoch_all</h2><p class='desc'>세 모델의 에폭별 평가 전체 합본 (전 지표)</p><p class='models'>MSEOnly_1.3_e500_phys0.3 · l10.1_phys0.5 · tfmL_d256h8L4f1024_phys0.3</p><p class='facts'>1,520행 · 지표 48개 · epoch 20–4000 · 모델 3개<span class='gen'>생성 2026-10-02 02:26</span></p></a>
+<a class='card' href='evaluate_results.html'><h2>evaluate_results</h2><p class='desc'>실험 로그 — 모델별 최종 체크포인트 평가 (_anat 모델만 표시)</p><p class='models'>tfm_declip_cov_MSEOnly_1.05_anat · tfm_declip_cov_MSEOnly_1.1_anat · tfm_declip_cov_MSEOnly_1.2_anat · tfm_declip_cov_MSEOnly_1.3_anat · tfm_declip_cov_l10.1_anat</p><p class='facts'>180행 · 지표 47개 · 모델 5개<span class='gen'>생성 2026-10-02 02:26</span></p></a>
+</nav>
+<footer>각 페이지의 데이터는 같은 이름의 .csv 파일에서 만들어졌습니다.</footer>
+</main>
+</body>
+</html>
