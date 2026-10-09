@@ -1,0 +1,17 @@
+# MCC 루트의 .gitignore 는 *.pth / checkpoints / Sample_Data 를 무시한다.
+# Release 는 모델 가중치와 뼈대 오프셋이 없으면 실행되지 않으므로 여기서 다시 포함시킨다
+# (하위 폴더의 .gitignore 가 상위 규칙보다 우선한다).
+!checkpoints/
+!checkpoints/**
+!*.pth
+!Sample_Data/
+!Sample_Data/Standard_BoneOffsets.csv
+
+# 실행 중 생기는 것
+__pycache__/
+AI_Streaming/logs/
+*.log
+
+# 데이터셋은 배포하지 않는다 (README 의 '데이터셋' 참고)
+processed_motions_VMC/
+*.pt

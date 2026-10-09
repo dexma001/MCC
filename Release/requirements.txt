@@ -1,0 +1,7 @@
+# 실시간 서비스 (vmc_bridge · server · control)
+# 검증 환경(2026-10-07): Python 3.11.9, torch 2.2.2+cu121, numpy 1.26.4, pandas 3.0.2, python-osc 1.8.3
+# CPU 만으로 동작한다 (브리지는 device="cpu"). GPU 빌드 torch 를 쓰려면 PyTorch 공식 안내의 index-url 로 설치.
+torch>=2.2
+numpy>=1.26,<2
+pandas>=2.0
+python-osc>=1.8
